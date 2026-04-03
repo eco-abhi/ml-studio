@@ -32,7 +32,7 @@ A full-stack web application for uploading datasets, training multiple ML models
 ### 1. Clone & Setup
 
 ```bash
-cd wine-ml-app
+cd ml-studio
 ```
 
 ### 2. Backend Setup
@@ -153,7 +153,7 @@ Open in browser: http://localhost:5173
 ## Project Structure
 
 ```
-wine-ml-app/
+ml-studio/
 ├── backend/
 │   ├── main.py              # FastAPI app + all routes
 │   ├── train.py             # Training pipeline (regression + classification)

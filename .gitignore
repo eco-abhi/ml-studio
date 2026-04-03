@@ -38,8 +38,8 @@ dist/
 *.sqlite3
 
 # App runtime data (uploads + dataset registry)
-wine-ml-app/backend/data/uploads/
-wine-ml-app/backend/data/datasets.json
+ml-studio/backend/data/uploads/
+ml-studio/backend/data/datasets.json
 
 # Logs & coverage
 *.log
