@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-slate-200;
+  }
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell,
+      "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif;
+  }
+  table {
+    font-family: ui-monospace, "SFMono-Regular", "Menlo", "Monaco", "Consolas", monospace;
+  }
+}
+
+/* Custom range input */
+input[type="range"] {
+  @apply w-full h-1.5 rounded-full appearance-none cursor-pointer;
+  background: #e2e8f0;
+}
+input[type="range"]::-webkit-slider-thumb {
+  @apply appearance-none w-4 h-4 rounded-full bg-blue-600 cursor-pointer;
+  -webkit-appearance: none;
+}
+input[type="range"]::-webkit-slider-thumb:hover {
+  @apply bg-blue-700;
+}

@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+mlflow
+scikit-learn
+imbalanced-learn
+pandas
+numpy
+shap
+xgboost
+requests
+python-multipart
+python-dotenv
+optuna
+supabase
