@@ -25,7 +25,7 @@ A full-stack web application for uploading datasets, training multiple ML models
 **Frontend:**
 - React 18
 - Vite (dev server)
-- Vanilla CSS (no dependencies)
+- Tailwind CSS + accessible UI primitives
 
 ## Quick Start
 
