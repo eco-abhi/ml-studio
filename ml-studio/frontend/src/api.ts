@@ -265,6 +265,33 @@ export const getExperiments = (datasetId: string): Promise<{ runs: ExperimentRun
 export const getImportances = (datasetId: string, modelName: string): Promise<ImportanceItem[]> =>
   fetch(`${BASE}/importances/${datasetId}/${modelName}`, withAuth()).then((r) => r.json());
 
+// ── Diagnostics ───────────────────────────────────────────────────────────────
+
+export interface DiagnosticsPayload {
+  task_type: TaskType;
+  confusion_matrix?: { labels: string[]; matrix: number[][] };
+  classification_report?: Record<string, Record<string, number> | number | undefined>;
+  roc_curve?: { fpr: number[]; tpr: number[]; auc: number };
+  roc_auc_macro_ovr?: number;
+  calibration?: { mean_predicted: number[]; fraction_positives: number[] };
+  regression?: Record<string, number>;
+  residual_histogram?: { counts: number[]; edges: number[] };
+  learning_curve?: {
+    train_sizes: number[];
+    train_score_mean: number[];
+    val_score_mean: number[];
+    metric: "rmse" | "accuracy";
+  } | null;
+  permutation_importance?: { feature: string; mean: number; std: number }[];
+}
+
+export const getDiagnostics = (datasetId: string, modelName: string): Promise<DiagnosticsPayload> =>
+  fetch(`${BASE}/diagnostics/${datasetId}/${encodeURIComponent(modelName)}`, withAuth()).then(async (r) => {
+    const j = await r.json();
+    if (!r.ok) throw new Error((j as { detail?: string }).detail || "Diagnostics failed");
+    return j as DiagnosticsPayload;
+  });
+
 // ── Predict ───────────────────────────────────────────────────────────────────
 
 export const predict = (

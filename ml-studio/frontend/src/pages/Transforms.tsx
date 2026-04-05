@@ -1,4 +1,4 @@
-import { AlertTriangle, BookOpen, ChevronDown, GripVertical, History, Pencil, Plus, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { AlertTriangle, BookOpen, ChevronDown, GripVertical, History, Loader2, Pencil, Plus, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { Select } from "../components/ui/select";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
@@ -11,6 +11,7 @@ import {
   type TransformApplyResult,
   type TransformPreview,
 } from "../api";
+import { LoadingState } from "../components/LoadingState";
 import { RenameEditor } from "../components/RenameEditor";
 import { TransformTypePicker } from "../components/TransformTypePicker";
 import { PageShell } from "../components/PageShell";
@@ -147,22 +148,36 @@ export default function Transforms({ datasetId, transformSyncKey = 0, onTransfor
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
   const [draggingAppliedIdx, setDraggingAppliedIdx] = useState<number | null>(null);
   const dragAppliedFromRef = useRef<number | null>(null);
+  const [pipelineReady, setPipelineReady] = useState(false);
 
   useEffect(() => { setResult(null); setPreview(null); }, [pendingSteps]);
 
   const refreshHistory = useCallback(() => {
     if (!datasetId) return;
-    getTransformHistory(datasetId)
-      .then((h) => {
-        setHasActive(h.active);
-        setAppliedAt(h.applied_at);
-        setAppliedSteps(h.steps.map((s) => deserializeStep(s as Record<string, unknown>)));
-      })
-      .catch(() => {});
-    previewDataset(datasetId, 1).then((r) => setColumns(r.columns)).catch(() => {});
+    setPipelineReady(false);
+    Promise.all([
+      getTransformHistory(datasetId)
+        .then((h) => {
+          setHasActive(h.active);
+          setAppliedAt(h.applied_at);
+          setAppliedSteps(h.steps.map((s) => deserializeStep(s as Record<string, unknown>)));
+        })
+        .catch(() => {}),
+      previewDataset(datasetId, 1)
+        .then((r) => setColumns(r.columns))
+        .catch(() => setColumns([])),
+    ]).finally(() => setPipelineReady(true));
   }, [datasetId]);
 
-  useEffect(() => { refreshHistory(); }, [refreshHistory, transformSyncKey]);
+  useEffect(() => {
+    if (!datasetId) {
+      setPipelineReady(false);
+      setAppliedSteps([]);
+      setColumns([]);
+      return;
+    }
+    refreshHistory();
+  }, [datasetId, transformSyncKey, refreshHistory]);
 
   if (!datasetId) {
     return (
@@ -188,6 +203,17 @@ export default function Transforms({ datasetId, transformSyncKey = 0, onTransfor
             <TransformsWarningsGuide />
           </TabsContent>
         </Tabs>
+      </PageShell>
+    );
+  }
+
+  if (!pipelineReady) {
+    return (
+      <PageShell
+        title="Transforms"
+        description="Build a preprocessing pipeline. Apply it before training to produce a cleaned dataset."
+      >
+        <LoadingState variant="page" message="Loading pipeline and columns…" />
       </PageShell>
     );
   }
@@ -523,7 +549,11 @@ export default function Transforms({ datasetId, transformSyncKey = 0, onTransfor
                   </div>
                 ))}
                 <Button onClick={handleReset} disabled={loadingReset} variant="ghost" size="sm" className="text-slate-500 w-full mt-1">
-                  <RotateCcw className="w-3.5 h-3.5" />Reset all to original
+                  {loadingReset ? (
+                    <><Loader2 className="w-3.5 h-3.5 animate-spin" />Resetting…</>
+                  ) : (
+                    <><RotateCcw className="w-3.5 h-3.5" />Reset all to original</>
+                  )}
                 </Button>
               </div>
             )}
@@ -596,18 +626,24 @@ export default function Transforms({ datasetId, transformSyncKey = 0, onTransfor
                 className="w-full"
                 variant="secondary"
               >
-                {loadingPreview ? "Loading…" : "Preview (5 rows)"}
+                {loadingPreview ? (
+                  <><Loader2 className="w-4 h-4 animate-spin" />Loading preview…</>
+                ) : (
+                  "Preview (5 rows)"
+                )}
               </Button>
               <Button
                 onClick={handleApply}
                 disabled={loadingApply || !pendingSteps.length || inlineEditIdx !== null}
                 className="w-full"
               >
-                {loadingApply
-                  ? "Applying…"
-                  : pipelineReplaceMode
-                    ? <><Save className="w-4 h-4" />Replace pipeline</>
-                    : <><Save className="w-4 h-4" />Apply &amp; Save</>}
+                {loadingApply ? (
+                  <><Loader2 className="w-4 h-4 animate-spin" />Applying…</>
+                ) : pipelineReplaceMode ? (
+                  <><Save className="w-4 h-4" />Replace pipeline</>
+                ) : (
+                  <><Save className="w-4 h-4" />Apply &amp; Save</>
+                )}
               </Button>
               {pipelineReplaceMode && (
                 <Button type="button" onClick={cancelPipelineReplace} variant="ghost" size="sm" className="w-full text-slate-600">
@@ -616,7 +652,11 @@ export default function Transforms({ datasetId, transformSyncKey = 0, onTransfor
               )}
               {!hasActive && (
                 <Button onClick={handleReset} disabled={loadingReset} variant="ghost" size="sm" className="w-full text-slate-500">
-                  <RotateCcw className="w-3.5 h-3.5" />Reset to original
+                  {loadingReset ? (
+                    <><Loader2 className="w-3.5 h-3.5 animate-spin" />Resetting…</>
+                  ) : (
+                    <><RotateCcw className="w-3.5 h-3.5" />Reset to original</>
+                  )}
                 </Button>
               )}
             </CardContent>

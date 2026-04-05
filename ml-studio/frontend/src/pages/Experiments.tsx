@@ -1,10 +1,10 @@
 import React, { useEffect, useState } from "react";
 import { getExperiments, getMLflowInfo, type ExperimentRun, type MLflowInfo, type TaskType } from "../api";
+import { LoadingState } from "../components/LoadingState";
 import { Select } from "../components/ui/select";
 import { PageShell } from "../components/PageShell";
 import { Badge } from "../components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
-import { Skeleton } from "../components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 
 type MetricKey = "rmse" | "mae" | "r2" | "cv_rmse" | "accuracy" | "f1_score" | "roc_auc";
@@ -136,7 +136,7 @@ export default function Experiments({ datasetId, experimentsSyncKey = 0 }: Props
   if (loading) return (
     <PageShell title="Experiments">
       <MlflowLocalHint info={mlflowInfo} />
-      <div className="space-y-4">{[1,2,3].map(i => <Skeleton key={i} className="h-12 w-full" />)}</div>
+      <LoadingState variant="page" message="Loading experiment runs…" />
     </PageShell>
   );
 

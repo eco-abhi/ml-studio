@@ -1,4 +1,5 @@
 import {
+  Activity,
   BarChart2,
   Cpu,
   Database,
@@ -15,13 +16,14 @@ import { InfoDrawer } from "./components/InfoDrawer";
 import { cn } from "./lib/utils";
 import EDA from "./pages/EDA";
 import Experiments from "./pages/Experiments";
+import Diagnostics from "./pages/Diagnostics";
 import Importances from "./pages/Importances";
 import Predict from "./pages/Predict";
 import Train from "./pages/Train";
 import Transforms from "./pages/Transforms";
 import UploadPage from "./pages/Upload";
 
-type Page = "upload" | "eda" | "transforms" | "train" | "experiments" | "importances" | "predict";
+type Page = "upload" | "eda" | "transforms" | "train" | "experiments" | "importances" | "diagnostics" | "predict";
 
 const NAV: { key: Page; path: string; label: string; icon: React.ElementType; group: string }[] = [
   { key: "upload",      path: "/",             label: "Upload",      icon: Upload,            group: "Data"   },
@@ -30,6 +32,7 @@ const NAV: { key: Page; path: string; label: string; icon: React.ElementType; gr
   { key: "train",       path: "/train",         label: "Train",       icon: Cpu,               group: "Models" },
   { key: "experiments", path: "/experiments",   label: "Experiments", icon: FlaskConical,      group: "Models" },
   { key: "importances", path: "/importances",   label: "Importances", icon: Layers,            group: "Models" },
+  { key: "diagnostics", path: "/diagnostics",   label: "Diagnostics", icon: Activity,          group: "Models" },
   { key: "predict",     path: "/predict",       label: "Predict",     icon: Sparkles,          group: "Models" },
 ];
 
@@ -197,6 +200,9 @@ export default function App() {
         </div>
         <div className={page === "importances" ? undefined : "hidden"}>
           <Importances datasetId={datasetId} experimentsSyncKey={experimentsSyncKey} />
+        </div>
+        <div className={page === "diagnostics" ? undefined : "hidden"}>
+          <Diagnostics datasetId={datasetId} experimentsSyncKey={experimentsSyncKey} />
         </div>
         <div className={page === "predict"     ? undefined : "hidden"}>
           <Predict datasetId={datasetId} experimentsSyncKey={experimentsSyncKey} />

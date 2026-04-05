@@ -25,11 +25,11 @@ import {
   VAL_STRATEGIES,
 } from "../components/SplitConfigPanel";
 import { ML_PIPELINE_SPLIT_COLUMN } from "../transformTypes";
+import { LoadingState } from "../components/LoadingState";
 import { PageShell } from "../components/PageShell";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
-import { Skeleton } from "../components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 
 interface Props {
@@ -194,8 +194,8 @@ export default function Train({ datasetId, onTrainingComplete }: Props) {
 
   if (loadingPreview) {
     return (
-      <PageShell title="Train">
-        <div className="space-y-3">{[1,2,3].map((i) => <Skeleton key={i} className="h-12 w-full" />)}</div>
+      <PageShell title="Train" description="Select a target, configure validation, then train or tune.">
+        <LoadingState variant="page" message="Loading dataset preview…" />
       </PageShell>
     );
   }

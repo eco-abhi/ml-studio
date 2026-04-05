@@ -2,7 +2,7 @@ import { Check, Copy, Info, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
 
-type Page = "upload" | "eda" | "transforms" | "train" | "experiments" | "importances" | "predict";
+type Page = "upload" | "eda" | "transforms" | "train" | "experiments" | "importances" | "diagnostics" | "predict";
 
 interface HParamDoc {
   name: string;
@@ -450,6 +450,24 @@ result = permutation_importance(
 
 imp = pd.Series(result.importances_mean, index=X.columns)
 print(imp.sort_values(ascending=False))`,
+      },
+    ],
+  },
+
+  diagnostics: {
+    title: "Model diagnostics",
+    summary:
+      "Hold-out evaluation: confusion matrix and report for classification; ROC and calibration for binary; residuals and learning curve for regression; permutation importance for any task.",
+    sections: [
+      {
+        heading: "What you see",
+        body: "Metrics are computed on the same test split used after training (from __ml_split__ or your configured hold-out). Heavy steps subsample rows to keep the UI responsive.",
+        code: `# Backend: sklearn.metrics + inspection
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.inspection import permutation_importance
+
+# ROC / calibration need predict_proba (classifiers)
+# Learning curve retrains on growing subsets (regression)`,
       },
     ],
   },

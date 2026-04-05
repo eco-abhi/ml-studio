@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { getExperiments, getImportances, type ExperimentRun, type ImportanceItem } from "../api";
+import { LoadingState } from "../components/LoadingState";
 import { Select } from "../components/ui/select";
 import { PageShell } from "../components/PageShell";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
-import { Skeleton } from "../components/ui/skeleton";
 
 const COLORS = ["#3b82f6", "#f59e0b"];
 
@@ -20,14 +20,18 @@ export default function Importances({ datasetId, experimentsSyncKey = 0 }: Props
   const [impsB, setImpsB] = useState<ImportanceItem[] | null>(null);
   const [loadingA, setLoadingA] = useState(false);
   const [loadingB, setLoadingB] = useState(false);
+  const [runsLoading, setRunsLoading] = useState(false);
 
   useEffect(() => {
     if (!datasetId) return;
-    getExperiments(datasetId).then((d) => {
-      setRuns(d.runs);
-      if (d.runs[0]) setModelA(d.runs[0].model);
-      if (d.runs[1]) setModelB(d.runs[1].model);
-    });
+    setRunsLoading(true);
+    getExperiments(datasetId)
+      .then((d) => {
+        setRuns(d.runs);
+        if (d.runs[0]) setModelA(d.runs[0].model);
+        if (d.runs[1]) setModelB(d.runs[1].model);
+      })
+      .finally(() => setRunsLoading(false));
   }, [datasetId, experimentsSyncKey]);
 
   useEffect(() => {
@@ -47,6 +51,13 @@ export default function Importances({ datasetId, experimentsSyncKey = 0 }: Props
   }, [modelB, datasetId]);
 
   if (!datasetId) return <Empty />;
+  if (runsLoading) {
+    return (
+      <PageShell title="Feature Importances" description="Compare which features each model relies on.">
+        <LoadingState variant="page" message="Loading trained models…" />
+      </PageShell>
+    );
+  }
   if (!runs.length) return <Empty msg="No trained models found." />;
 
   // Deduplicate by model name so selectors never have duplicate keys/options
@@ -85,7 +96,7 @@ export default function Importances({ datasetId, experimentsSyncKey = 0 }: Props
         </div>
 
         {(loadingA || loadingB) && (
-          <div className="space-y-3">{[1,2,3,4].map(i => <Skeleton key={i} className="h-10 w-full" />)}</div>
+          <LoadingState message="Computing feature importances…" className="min-h-[200px]" />
         )}
 
         {/* ── Legend ── */}

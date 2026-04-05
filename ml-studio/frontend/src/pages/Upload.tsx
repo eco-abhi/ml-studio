@@ -7,6 +7,7 @@ import {
   uploadURL,
   type PreviewResult,
 } from "../api";
+import { LoadingState } from "../components/LoadingState";
 import { PageShell } from "../components/PageShell";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -112,11 +113,10 @@ export default function Upload({
                         {preview.numeric_columns.length} numeric
                       </p>
                     )}
-                    {loadingCurrent && (
-                      <p className="mt-2 text-xs text-blue-600 flex items-center gap-2">
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        Loading preview…
-                      </p>
+                    {loadingCurrent && !preview && (
+                      <div className="mt-3 rounded-lg border border-blue-100 bg-white/70 px-2 py-4">
+                        <LoadingState message="Loading dataset preview…" className="!py-4" />
+                      </div>
                     )}
                   </div>
                 </div>

@@ -63,10 +63,10 @@ import { StepCard } from "./Transforms";
 import { RenameEditor } from "../components/RenameEditor";
 import { TransformTypePicker } from "../components/TransformTypePicker";
 import { cn } from "../lib/utils";
+import { LoadingState } from "../components/LoadingState";
 import { PageShell } from "../components/PageShell";
 import { Badge } from "../components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
-import { Skeleton } from "../components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 
 interface Props {
@@ -277,7 +277,7 @@ function StatsTab({
 function HeatmapInner({ datasetId, source }: { datasetId: string; source: EdaDataSource }) {
   const [data, setData] = useState<CorrelationMatrix | null>(null);
   useEffect(() => { getCorrelationMatrix(datasetId, source).then(setData); }, [datasetId, source]);
-  if (!data) return <div className="space-y-2">{[1,2,3].map(i=><Skeleton key={i} className="h-8 w-full"/>)}</div>;
+  if (!data) return <LoadingState message="Loading correlation matrix…" className="min-h-[220px]" />;
 
   const n = data.columns.length;
   const cellSize = Math.min(52, Math.floor(680 / n));
@@ -426,15 +426,16 @@ function ScatterInner({
               type="button"
               onClick={fetchScatter}
               disabled={loading}
-              className="px-3 py-1.5 bg-blue-600 text-white text-xs rounded hover:bg-blue-700 disabled:opacity-50"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white text-xs rounded hover:bg-blue-700 disabled:opacity-50"
             >
-              {loading ? "Loading…" : "Plot"}
+              {loading ? <><Loader2 className="h-3.5 w-3.5 animate-spin" />Loading…</> : "Plot"}
             </button>
           </div>
         </div>
       </CardHeader>
-      <CardContent>
-        {data && (
+      <CardContent className="relative min-h-[200px]">
+        {loading && <LoadingState variant="overlay" message="Loading scatter plot…" className="rounded-lg" />}
+        {data && !loading && (
           <svg width={W} height={H} className="w-full">
             {/* Axes */}
             <line x1={PAD} y1={H - PAD} x2={W - PAD} y2={H - PAD} stroke="#e2e8f0" strokeWidth={1} />
@@ -447,7 +448,9 @@ function ScatterInner({
             ))}
           </svg>
         )}
-        {!data && <p className="text-sm text-slate-500 py-8 text-center">Select axes and click Plot</p>}
+        {!data && !loading && (
+          <p className="text-sm text-slate-500 py-8 text-center">Select axes and click Plot</p>
+        )}
       </CardContent>
     </Card>
   );
@@ -478,7 +481,7 @@ function ScatterTab({
 function MissingInner({ datasetId, source }: { datasetId: string; source: EdaDataSource }) {
   const [data, setData] = useState<MissingValues | null>(null);
   useEffect(() => { getMissingValues(datasetId, source).then(setData); }, [datasetId, source]);
-  if (!data) return <Skeleton className="h-40 w-full" />;
+  if (!data) return <LoadingState message="Loading missing-value stats…" className="min-h-[200px]" />;
 
   const cols = Object.entries(data).sort(([, a], [, b]) => b.pct - a.pct);
   const total = cols.reduce((s, [, v]) => s + v.count, 0);
@@ -524,7 +527,7 @@ function MissingTab({ datasetId, transformActive }: { datasetId: string; transfo
 function OutliersInner({ datasetId, source }: { datasetId: string; source: EdaDataSource }) {
   const [data, setData] = useState<OutlierInfo | null>(null);
   useEffect(() => { getOutliers(datasetId, source).then(setData); }, [datasetId, source]);
-  if (!data) return <Skeleton className="h-40 w-full" />;
+  if (!data) return <LoadingState message="Loading outlier summary…" className="min-h-[200px]" />;
 
   const cols = Object.entries(data).sort(([, a], [, b]) => b.n_outliers - a.n_outliers);
 
@@ -574,7 +577,7 @@ function OutliersTab({ datasetId, transformActive }: { datasetId: string; transf
 function CategoricalInner({ datasetId, source }: { datasetId: string; source: EdaDataSource }) {
   const [data, setData] = useState<CategoricalStats | null>(null);
   useEffect(() => { getCategorical(datasetId, source).then(setData); }, [datasetId, source]);
-  if (!data) return <Skeleton className="h-40 w-full" />;
+  if (!data) return <LoadingState message="Loading categorical stats…" className="min-h-[200px]" />;
 
   const cols = Object.entries(data);
   if (!cols.length) return <p className="text-sm text-slate-500">No categorical (non-numeric) columns found.</p>;
@@ -621,7 +624,7 @@ function CategoricalTab({ datasetId, transformActive }: { datasetId: string; tra
 function HealthInner({ datasetId, source }: { datasetId: string; source: EdaDataSource }) {
   const [data, setData] = useState<HealthResult | null>(null);
   useEffect(() => { getHealth(datasetId, source).then(setData); }, [datasetId, source]);
-  if (!data) return <div className="space-y-3">{[1,2,3,4].map(i=><Skeleton key={i} className="h-16 w-full"/>)}</div>;
+  if (!data) return <LoadingState message="Loading health metrics…" className="min-h-[240px]" />;
 
   const completenessEntries = Object.entries(data.completeness).sort(([,a],[,b]) => a - b);
 
@@ -737,7 +740,7 @@ function TargetInner({
   return (
     <div className="space-y-5">
       <Select value={sel} onChange={setSel} options={columns.map(c=>({ value: c, label: c }))} />
-      {loading && <div className="space-y-3">{[1,2,3].map(i=><Skeleton key={i} className="h-16 w-full"/>)}</div>}
+      {loading && <LoadingState message="Loading target analysis…" className="min-h-[200px]" />}
       {data && data.is_numeric && (
         <>
           {/* Skewness badge + hint */}
@@ -855,7 +858,7 @@ function TargetTab({
 function SkewnessInner({ datasetId, source }: { datasetId: string; source: EdaDataSource }) {
   const [data, setData] = useState<SkewnessRow[] | null>(null);
   useEffect(() => { getSkewness(datasetId, source).then(setData); }, [datasetId, source]);
-  if (!data) return <Skeleton className="h-40 w-full" />;
+  if (!data) return <LoadingState message="Loading skewness & kurtosis…" className="min-h-[200px]" />;
 
   const severityColor = { normal: "text-emerald-600", moderate: "text-amber-600", high: "text-rose-600" };
   const severityBg    = { normal: "bg-emerald-500",  moderate: "bg-amber-500",   high: "bg-rose-500" };
@@ -957,7 +960,7 @@ function BoxplotInner({
         })}
       </div>
 
-      {loading && <Skeleton className="h-60 w-full" />}
+      {loading && <LoadingState message="Loading box plots…" className="min-h-[240px]" />}
 
       {data && !loading && (
         <Card>
@@ -1069,7 +1072,7 @@ function PairplotInner({
         })}
       </div>
 
-      {loading && <Skeleton className="h-64 w-full" />}
+      {loading && <LoadingState message="Loading pairplot…" className="min-h-[260px]" />}
 
       {data && !loading && (
         <Card>
@@ -1179,7 +1182,7 @@ function FeatureTargetInner({
         <Select value={target} onChange={setTarget} options={columns.map(c=>({ value: c, label: c }))} className="w-48" />
       </div>
 
-      {loading && <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">{[1,2,3,4].map(i=><Skeleton key={i} className="h-52 w-full"/>)}</div>}
+      {loading && <LoadingState message="Loading feature vs target…" className="min-h-[220px]" />}
 
       {data && !loading && (
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -1459,7 +1462,7 @@ function QuickTransformPanel({
       </button>
 
       {open && (
-        <div className="space-y-4 border-t border-blue-200/80 bg-white/80 px-4 pb-4 pt-4 backdrop-blur-[2px]">
+        <div className="relative space-y-4 rounded-b-2xl border-t border-blue-200/80 bg-white/80 px-4 pb-4 pt-4 backdrop-blur-[2px]">
           {pipelineReplaceMode && (
             <div className="rounded-xl border border-violet-200 bg-violet-50 px-3 py-2.5 text-[11px] leading-snug text-violet-900">
               <p className="font-semibold text-violet-950">Replacing the full pipeline</p>
@@ -1946,6 +1949,9 @@ function QuickTransformPanel({
               </button>
             </div>
           )}
+          {applying && (
+            <LoadingState variant="overlay" message="Applying transforms…" className="rounded-b-2xl" />
+          )}
         </div>
       )}
     </div>
@@ -2266,11 +2272,13 @@ export default function EDA({ datasetId, transformSyncKey = 0, onTransformsMutat
   }, [transformHistory]);
 
   if (!datasetId) return <PageShell title="EDA"><p className="text-sm text-slate-500">Upload a dataset first.</p></PageShell>;
-  if (loading) return (
-    <PageShell title="EDA">
-      <div className="space-y-3">{[1,2,3].map(i=><Skeleton key={i} className="h-12 w-full"/>)}</div>
-    </PageShell>
-  );
+  if (loading) {
+    return (
+      <PageShell title="EDA" description="Loading dataset overview…">
+        <LoadingState variant="page" message="Loading dataset and transform state…" />
+      </PageShell>
+    );
+  }
   if (!eda) return <PageShell title="EDA"><p className="text-sm text-slate-500">No data available.</p></PageShell>;
 
   const transformActive = Boolean(transformHistory?.active);

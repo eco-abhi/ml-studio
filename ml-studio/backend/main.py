@@ -30,6 +30,7 @@ from eda import (
     compute_skewness,
     compute_target_analysis,
 )
+from diagnostics import compute_diagnostics
 from predict import get_feature_importances, load_model, run_prediction
 from train import CLASSIFICATION_MODELS, REGRESSION_MODELS, detect_task_type, load_and_prepare_data, train_all
 from tune import run_tuning
@@ -285,6 +286,37 @@ def get_experiments(dataset_id: str):
 
 
 # ── Feature importances ───────────────────────────────────────────────────────
+
+@app.get("/diagnostics/{dataset_id}/{model_name}")
+def get_model_diagnostics(dataset_id: str, model_name: str):
+    """Confusion matrix / ROC / calibration (classification), residuals & learning curve (regression), permutation importance."""
+    try:
+        dataset = _require_dataset(dataset_id)
+        if "target_col" not in dataset:
+            raise HTTPException(status_code=400, detail="Train on this dataset before running diagnostics.")
+
+        df = _load_df(dataset)
+        pipe = load_model(model_name, dataset_id)
+        if pipe is None:
+            raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+
+        from train import split_config_from_dict
+
+        task_type = dataset.get("task_type", "regression")
+        sc = split_config_from_dict(dataset.get("split_config") or {})
+        X_train, X_test, y_train, y_test, _feature_names, _num_cols, _cat_cols = load_and_prepare_data(
+            df, dataset["target_col"], sc, task_type
+        )
+        names = list(X_test.columns)
+        return compute_diagnostics(
+            pipe, X_train, X_test, y_train, y_test, task_type, names,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Request failed")
+        raise HTTPException(status_code=400, detail=_public_error_detail(e))
+
 
 @app.get("/importances/{dataset_id}/{model_name}")
 def get_importances(dataset_id: str, model_name: str):

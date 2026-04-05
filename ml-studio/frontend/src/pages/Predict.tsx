@@ -1,4 +1,4 @@
-import { RotateCcw, Sparkles, ZapIcon } from "lucide-react";
+import { Loader2, RotateCcw, Sparkles, ZapIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import {
@@ -9,11 +9,11 @@ import {
   type PredictionResult,
   type TaskType,
 } from "../api";
+import { LoadingState } from "../components/LoadingState";
 import { PageShell } from "../components/PageShell";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
-import { Skeleton } from "../components/ui/skeleton";
 
 const COLORS = ["#3b82f6","#10b981","#f59e0b","#ef4444","#8b5cf6","#06b6d4","#ec4899","#84cc16"];
 
@@ -90,11 +90,13 @@ export default function Predict({ datasetId, experimentsSyncKey = 0 }: Props) {
   const modelColor = (m: string) => COLORS[runs.findIndex((r) => r.model === m) % COLORS.length];
 
   if (!datasetId) return <Empty />;
-  if (!init) return (
-    <PageShell title="Predict">
-      <div className="space-y-3">{[1,2,3].map(i => <Skeleton key={i} className="h-10 w-full" />)}</div>
-    </PageShell>
-  );
+  if (!init) {
+    return (
+      <PageShell title="Predict" description="Adjust feature values and compare model outputs.">
+        <LoadingState variant="page" message="Loading models and feature metadata…" />
+      </PageShell>
+    );
+  }
   if (!runs.length) return <Empty msg="No trained models found." />;
 
   const numPreds = allResults?.filter((r) => typeof r.prediction === "number") ?? [];
@@ -171,10 +173,18 @@ export default function Predict({ datasetId, experimentsSyncKey = 0 }: Props) {
                 </select>
               </div>
               <Button onClick={handlePredict} disabled={loading} className="w-full">
-                {loading ? "Predicting…" : <><Sparkles className="w-4 h-4" />Predict</>}
+                {loading ? (
+                  <><Loader2 className="w-4 h-4 animate-spin" />Predicting…</>
+                ) : (
+                  <><Sparkles className="w-4 h-4" />Predict</>
+                )}
               </Button>
               <Button onClick={handleCompareAll} disabled={loadingAll} variant="success" className="w-full">
-                {loadingAll ? "Running all…" : <><ZapIcon className="w-4 h-4" />Compare All Models</>}
+                {loadingAll ? (
+                  <><Loader2 className="w-4 h-4 animate-spin" />Running all models…</>
+                ) : (
+                  <><ZapIcon className="w-4 h-4" />Compare All Models</>
+                )}
               </Button>
               <Button onClick={reset} variant="ghost" size="sm" className="w-full text-slate-500">
                 <RotateCcw className="w-3.5 h-3.5" />Reset to means
