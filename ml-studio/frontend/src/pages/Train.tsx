@@ -1,15 +1,17 @@
 import { ChevronDown, ChevronRight, Loader2, RefreshCw, Zap } from "lucide-react";
 import { Select } from "../components/ui/select";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { toast } from "sonner";
 import {
   previewDataset,
-  trainModels,
+  trainModelsWithProgress,
   tuneModel,
   type PreviewResult,
   type SplitConfig,
   type TaskType,
   type TrainResult,
+  type TrainStreamProgress,
   type TuneResult,
 } from "../api";
 import {
@@ -24,7 +26,9 @@ import {
   SplitConfigPanel,
   VAL_STRATEGIES,
 } from "../components/SplitConfigPanel";
+import { regressionFitHints, classificationFitHints } from "../lib/fitDiagnostics";
 import { ML_PIPELINE_SPLIT_COLUMN } from "../transformTypes";
+import { ChartExportButtons } from "../components/ChartExportButtons";
 import { LoadingState } from "../components/LoadingState";
 import { PageShell } from "../components/PageShell";
 import { Badge } from "../components/ui/badge";
@@ -88,6 +92,7 @@ export default function Train({ datasetId, onTrainingComplete }: Props) {
   const [selectedModels, setSelectedModels] = useState<Set<string>>(new Set());
   const [splitConfig, setSplitConfig]       = useState<SplitConfig>(DEFAULT_SPLIT_CONFIG);
   const [training, setTraining]             = useState(false);
+  const [trainProgress, setTrainProgress]   = useState<{ pct: number; label: string } | null>(null);
   const [trainResult, setTrainResult]       = useState<TrainResult | null>(null);
   const [runCount, setRunCount]             = useState(0);
 
@@ -96,6 +101,7 @@ export default function Train({ datasetId, onTrainingComplete }: Props) {
   const [nTrials, setNTrials]               = useState(30);
   const [tuning, setTuning]                 = useState(false);
   const [tuneResult, setTuneResult]         = useState<TuneResult | null>(null);
+  const tuneChartExportRef = useRef<HTMLDivElement>(null);
 
   const sharedModels = CLASSIFICATION_MODELS.filter((m) => REGRESSION_MODELS.includes(m));
   const allModels =
@@ -146,16 +152,39 @@ export default function Train({ datasetId, onTrainingComplete }: Props) {
       return next;
     });
 
+  const applyTrainStreamProgress = (e: TrainStreamProgress) => {
+    if (e.phase === "prepare") {
+      setTrainProgress({ pct: 12, label: e.message ?? "Preparing data…" });
+    } else {
+      const total = Math.max(e.total, 1);
+      const pct = 15 + (e.current / total) * 80;
+      const labelName = MODEL_META[e.model]?.label ?? e.model;
+      setTrainProgress({
+        pct: Math.min(96, pct),
+        label: `Training ${labelName} (${e.current} of ${total})`,
+      });
+    }
+  };
+
   const handleTrain = async () => {
     if (!targetCol || !datasetId) { toast.error("Select a target column first."); return; }
     if (taskType !== null && !selectedModels.size) { toast.error("Select at least one model."); return; }
     try {
       setTraining(true);
+      setTrainProgress({ pct: 4, label: "Starting…" });
       // When taskType is "auto" (null), don't risk sending incompatible hyperparams or
       // filtering by a model list that assumes the wrong task. Backend will detect the task type.
       const modelsToSend = taskType === null ? [] : [...selectedModels];
       const hyperparamsToSend = taskType === null ? {} : hyperparams;
-      const result = await trainModels(datasetId, targetCol, taskType, hyperparamsToSend, modelsToSend, splitConfig);
+      const result = await trainModelsWithProgress(
+        datasetId,
+        targetCol,
+        taskType,
+        hyperparamsToSend,
+        modelsToSend,
+        splitConfig,
+        applyTrainStreamProgress,
+      );
       setTrainResult(result);
       setRunCount((c) => c + 1);
       onTrainingComplete?.();
@@ -164,6 +193,7 @@ export default function Train({ datasetId, onTrainingComplete }: Props) {
       toast.error("Training failed: " + (e as Error).message);
     } finally {
       setTraining(false);
+      setTrainProgress(null);
     }
   };
 
@@ -352,6 +382,17 @@ export default function Train({ datasetId, onTrainingComplete }: Props) {
                       <span className="text-slate-600">{[...selectedModels].map((m) => MODEL_META[m]?.label ?? m).join(", ")}.</span>
                       {runCount > 0 && <span className="block mt-1 text-slate-400">Each run creates a new MLflow entry.</span>}
                     </div>
+                    {training && trainProgress && (
+                      <div className="space-y-2 rounded-lg border border-blue-200/80 bg-blue-50/50 px-3 py-3">
+                        <div className="h-2.5 overflow-hidden rounded-full bg-slate-200/90">
+                          <div
+                            className="h-full rounded-full bg-blue-600 transition-[width] duration-300 ease-out"
+                            style={{ width: `${trainProgress.pct}%` }}
+                          />
+                        </div>
+                        <p className="text-[11px] font-medium text-slate-700">{trainProgress.label}</p>
+                      </div>
+                    )}
                     <Button
                       onClick={handleTrain}
                       disabled={training || !selectedModels.size}
@@ -368,7 +409,9 @@ export default function Train({ datasetId, onTrainingComplete }: Props) {
                 </Card>
               )}
 
-              {trainResult && (
+              {trainResult && (() => {
+                const showCvStd = trainResult.results.some((r) => r.cv_std != null);
+                return (
                 <Card>
                   <CardHeader className="pb-3">
                     <div className="flex items-center gap-2">
@@ -381,7 +424,19 @@ export default function Train({ datasetId, onTrainingComplete }: Props) {
                       <Badge variant="secondary">{trainResult.n_train}↑ / {trainResult.n_test}↓</Badge>
                     </div>
                   </CardHeader>
-                  <CardContent className="pt-0">
+                  <CardContent className="pt-0 space-y-3">
+                    <p className="text-[11px] text-slate-500 leading-relaxed">
+                      <strong className="text-slate-600">Train</strong> = in-sample after fit;{" "}
+                      <strong className="text-slate-600">Test</strong> = hold-out;{" "}
+                      <strong className="text-slate-600">CV</strong> = cross-validation on training data. Learning curves:{" "}
+                      <Link
+                        to={datasetId ? `/diagnostics?d=${encodeURIComponent(datasetId)}` : "/diagnostics"}
+                        className="text-blue-600 underline font-medium"
+                      >
+                        Diagnostics
+                      </Link>
+                      .
+                    </p>
                     <div className="overflow-x-auto rounded-lg border border-slate-200">
                       <table className="w-full text-xs">
                         <thead>
@@ -389,47 +444,84 @@ export default function Train({ datasetId, onTrainingComplete }: Props) {
                             <th className="text-left px-3 py-2 font-semibold text-slate-600">Model</th>
                             {trainResult.task_type === "regression" ? (
                               <>
-                                <th className="text-center px-2 py-2 font-semibold text-slate-600">RMSE</th>
-                                <th className="text-center px-2 py-2 font-semibold text-slate-600">R²</th>
-                                {trainResult.results[0]?.cv_rmse != null && <th className="text-center px-2 py-2 font-semibold text-slate-600">CV</th>}
+                                <th className="text-center px-2 py-2 font-semibold text-slate-600" title="In-sample">R² tr</th>
+                                <th className="text-center px-2 py-2 font-semibold text-slate-600" title="Hold-out">R² te</th>
+                                <th className="text-center px-2 py-2 font-semibold text-slate-600" title="In-sample">RMSE tr</th>
+                                <th className="text-center px-2 py-2 font-semibold text-slate-600" title="Hold-out">RMSE te</th>
+                                {trainResult.results[0]?.cv_rmse != null && (
+                                  <th className="text-center px-2 py-2 font-semibold text-slate-600" title="Mean CV RMSE on train folds">CV</th>
+                                )}
+                                {showCvStd && (
+                                  <th className="text-center px-2 py-2 font-semibold text-slate-600" title="Std of fold scores">CV σ</th>
+                                )}
+                                <th className="text-left px-2 py-2 font-semibold text-slate-600 min-w-[140px]">Fit hints</th>
                               </>
                             ) : (
                               <>
-                                <th className="text-center px-2 py-2 font-semibold text-slate-600">Acc</th>
-                                <th className="text-center px-2 py-2 font-semibold text-slate-600">F1</th>
-                                {trainResult.results[0]?.cv_accuracy != null && <th className="text-center px-2 py-2 font-semibold text-slate-600">CV</th>}
+                                <th className="text-center px-2 py-2 font-semibold text-slate-600" title="In-sample">Acc tr</th>
+                                <th className="text-center px-2 py-2 font-semibold text-slate-600" title="Hold-out">Acc te</th>
+                                <th className="text-center px-2 py-2 font-semibold text-slate-600" title="Hold-out">F1 te</th>
+                                {trainResult.results[0]?.cv_accuracy != null && (
+                                  <th className="text-center px-2 py-2 font-semibold text-slate-600">CV acc</th>
+                                )}
+                                {trainResult.results[0]?.cv_std != null && (
+                                  <th className="text-center px-2 py-2 font-semibold text-slate-600">CV σ</th>
+                                )}
+                                <th className="text-left px-2 py-2 font-semibold text-slate-600 min-w-[140px]">Fit hints</th>
                               </>
                             )}
                           </tr>
                         </thead>
                         <tbody>
-                          {trainResult.results.map((r, i) => (
-                            <tr key={r.model} className={`border-b border-slate-100 last:border-0 ${i === 0 ? "bg-emerald-50" : "hover:bg-slate-50"}`}>
-                              <td className="px-3 py-2 font-medium text-slate-800">
-                                {i === 0 && <span className="mr-1 text-emerald-600">★</span>}
-                                {r.model.replace(/_/g, " ")}
-                              </td>
-                              {trainResult.task_type === "regression" ? (
-                                <>
-                                  <td className="px-2 py-2 text-center tabular-nums">{r.rmse}</td>
-                                  <td className="px-2 py-2 text-center tabular-nums">{r.r2}</td>
-                                  {r.cv_rmse != null && <td className="px-2 py-2 text-center tabular-nums text-slate-500">{r.cv_rmse}</td>}
-                                </>
-                              ) : (
-                                <>
-                                  <td className="px-2 py-2 text-center tabular-nums">{r.accuracy}</td>
-                                  <td className="px-2 py-2 text-center tabular-nums">{r.f1_score}</td>
-                                  {r.cv_accuracy != null && <td className="px-2 py-2 text-center tabular-nums text-slate-500">{r.cv_accuracy}</td>}
-                                </>
-                              )}
-                            </tr>
-                          ))}
+                          {trainResult.results.map((r, i) => {
+                            const hints =
+                              trainResult.task_type === "regression"
+                                ? regressionFitHints(r)
+                                : classificationFitHints(r);
+                            return (
+                              <tr key={r.model} className={`border-b border-slate-100 last:border-0 ${i === 0 ? "bg-emerald-50" : "hover:bg-slate-50"}`}>
+                                <td className="px-3 py-2 font-medium text-slate-800">
+                                  {i === 0 && <span className="mr-1 text-emerald-600">★</span>}
+                                  {r.model.replace(/_/g, " ")}
+                                </td>
+                                {trainResult.task_type === "regression" ? (
+                                  <>
+                                    <td className="px-2 py-2 text-center tabular-nums text-slate-600">{r.train_r2 ?? "—"}</td>
+                                    <td className="px-2 py-2 text-center tabular-nums">{r.r2}</td>
+                                    <td className="px-2 py-2 text-center tabular-nums text-slate-600">{r.train_rmse ?? "—"}</td>
+                                    <td className="px-2 py-2 text-center tabular-nums">{r.rmse}</td>
+                                    {r.cv_rmse != null && <td className="px-2 py-2 text-center tabular-nums text-slate-500">{r.cv_rmse}</td>}
+                                    {showCvStd && (
+                                      <td className="px-2 py-2 text-center tabular-nums text-slate-500">{r.cv_std ?? "—"}</td>
+                                    )}
+                                    <td className="px-2 py-2 text-[10px] text-slate-600 leading-snug max-w-[200px]">
+                                      {hints.length ? hints.map((h) => <div key={h}>• {h}</div>) : <span className="text-slate-400">—</span>}
+                                    </td>
+                                  </>
+                                ) : (
+                                  <>
+                                    <td className="px-2 py-2 text-center tabular-nums text-slate-600">{r.train_accuracy ?? "—"}</td>
+                                    <td className="px-2 py-2 text-center tabular-nums">{r.accuracy}</td>
+                                    <td className="px-2 py-2 text-center tabular-nums">{r.f1_score}</td>
+                                    {r.cv_accuracy != null && <td className="px-2 py-2 text-center tabular-nums text-slate-500">{r.cv_accuracy}</td>}
+                                    {showCvStd && (
+                                      <td className="px-2 py-2 text-center tabular-nums text-slate-500">{r.cv_std ?? "—"}</td>
+                                    )}
+                                    <td className="px-2 py-2 text-[10px] text-slate-600 leading-snug max-w-[200px]">
+                                      {hints.length ? hints.map((h) => <div key={h}>• {h}</div>) : <span className="text-slate-400">—</span>}
+                                    </td>
+                                  </>
+                                )}
+                              </tr>
+                            );
+                          })}
                         </tbody>
                       </table>
                     </div>
                   </CardContent>
                 </Card>
-              )}
+                );
+              })()}
             </div>
           </div>
         </TabsContent>
@@ -600,14 +692,29 @@ export default function Train({ datasetId, onTrainingComplete }: Props) {
                       const bestPts  = best.map((v, i) => `${sx(i)},${sy(v)}`).join(" ");
                       return (
                         <div>
-                          <p className="text-xs font-semibold text-slate-600 mb-1.5">Convergence — {tuneResult.metric_name}</p>
-                          <svg width={W} height={H} className="w-full border border-slate-100 rounded-lg bg-slate-50">
-                            <polyline points={trialPts} fill="none" stroke="#94a3b8" strokeWidth={1} />
-                            <polyline points={bestPts}  fill="none" stroke="#10b981" strokeWidth={2} />
-                          </svg>
-                          <div className="flex gap-3 mt-1 text-[10px]">
-                            <span className="flex items-center gap-1"><span className="w-3 h-0.5 inline-block bg-slate-400" />Each trial</span>
-                            <span className="flex items-center gap-1"><span className="w-3 h-0.5 inline-block bg-emerald-500" />Best so far</span>
+                          <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
+                            <p className="text-xs font-semibold text-slate-600">Convergence — {tuneResult.metric_name}</p>
+                            <ChartExportButtons
+                              targetRef={tuneChartExportRef}
+                              filenameBase={`train_tune_${tuneResult.model}_${tuneResult.metric_name}`}
+                              className="shrink-0"
+                            />
+                          </div>
+                          <div ref={tuneChartExportRef} className="rounded-lg border border-slate-100 bg-slate-50 p-2">
+                            <svg width={W} height={H} className="w-full">
+                              <polyline points={trialPts} fill="none" stroke="#94a3b8" strokeWidth={1} />
+                              <polyline points={bestPts} fill="none" stroke="#10b981" strokeWidth={2} />
+                            </svg>
+                            <div className="mt-1 flex gap-3 text-[10px]">
+                              <span className="flex items-center gap-1">
+                                <span className="inline-block h-0.5 w-3 bg-slate-400" />
+                                Each trial
+                              </span>
+                              <span className="flex items-center gap-1">
+                                <span className="inline-block h-0.5 w-3 bg-emerald-500" />
+                                Best so far
+                              </span>
+                            </div>
                           </div>
                         </div>
                       );

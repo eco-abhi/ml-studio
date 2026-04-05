@@ -1,3 +1,6 @@
+from collections.abc import Callable
+from typing import Any
+
 import mlflow
 import mlflow.sklearn
 import pandas as pd
@@ -433,13 +436,16 @@ def _cv_classification_scores(pipe, X_train, y_train, cfg: SplitConfig):
 def train_regression_models(X_train, X_test, y_train, y_test, feature_names,
                              dataset_name, task_type, hyperparams: dict,
                              selected_models: list[str] | None, cfg: SplitConfig,
-                             num_cols: list[str], cat_cols: list[str]):
+                             num_cols: list[str], cat_cols: list[str],
+                             progress_callback: Callable[[dict[str, Any]], None] | None = None):
     results = []
     all_models = build_regression_models(hyperparams)
     models = {k: v for k, v in all_models.items()
               if selected_models is None or k in selected_models}
-
-    for name, model in models.items():
+    total = len(models)
+    for mi, (name, model) in enumerate(models.items()):
+        if progress_callback:
+            progress_callback({"phase": "model", "current": mi + 1, "total": total, "model": name})
         pipe = build_model_pipeline(
             model, cfg, num_cols, cat_cols, classification=False,
         )
@@ -464,24 +470,34 @@ def train_regression_models(X_train, X_test, y_train, y_test, feature_names,
 
             pipe.fit(X_train, y_train)
             preds = pipe.predict(X_test)
+            preds_train = pipe.predict(X_train)
 
             rmse = round(float(np.sqrt(mean_squared_error(y_test, preds))), 4)
             mae  = round(float(mean_absolute_error(y_test, preds)), 4)
             r2   = round(float(r2_score(y_test, preds)), 4)
+            rmse_train = round(float(np.sqrt(mean_squared_error(y_train, preds_train))), 4)
+            mae_train = round(float(mean_absolute_error(y_train, preds_train)), 4)
+            r2_train = round(float(r2_score(y_train, preds_train)), 4)
 
             cv_scores = _cv_regression_scores(pipe, X_train, y_train, cfg)
 
             mlflow.log_metric("rmse", rmse)
             mlflow.log_metric("mae",  mae)
             mlflow.log_metric("r2",   r2)
+            mlflow.log_metric("train_rmse", rmse_train)
+            mlflow.log_metric("train_mae", mae_train)
+            mlflow.log_metric("train_r2", r2_train)
             for k, v in cv_scores.items():
                 if isinstance(v, float): mlflow.log_metric(k, v)
 
             mlflow.sklearn.log_model(pipe, artifact_path="model",
                                      registered_model_name=f"{dataset_name}-{name}")
-            results.append({"model": name, "rmse": rmse, "mae": mae, "r2": r2,
-                             "cv_rmse": cv_scores.get("cv_rmse"),
-                             **{k: v for k, v in cv_scores.items() if k != "cv_rmse"}})
+            results.append({
+                "model": name, "rmse": rmse, "mae": mae, "r2": r2,
+                "rmse_train": rmse_train, "mae_train": mae_train, "r2_train": r2_train,
+                "cv_rmse": cv_scores.get("cv_rmse"),
+                **{k: v for k, v in cv_scores.items() if k != "cv_rmse"},
+            })
 
     return sorted(results, key=lambda x: x["rmse"])
 
@@ -489,13 +505,16 @@ def train_regression_models(X_train, X_test, y_train, y_test, feature_names,
 def train_classification_models(X_train, X_test, y_train, y_test, feature_names,
                                  dataset_name, task_type, hyperparams: dict,
                                  selected_models: list[str] | None, cfg: SplitConfig,
-                                 num_cols: list[str], cat_cols: list[str]):
+                                 num_cols: list[str], cat_cols: list[str],
+                                 progress_callback: Callable[[dict[str, Any]], None] | None = None):
     results = []
     all_models = build_classification_models(hyperparams)
     models = {k: v for k, v in all_models.items()
               if selected_models is None or k in selected_models}
-
-    for name, model in models.items():
+    total = len(models)
+    for mi, (name, model) in enumerate(models.items()):
+        if progress_callback:
+            progress_callback({"phase": "model", "current": mi + 1, "total": total, "model": name})
         pipe = build_model_pipeline(
             model, cfg, num_cols, cat_cols, classification=True,
         )
@@ -520,19 +539,30 @@ def train_classification_models(X_train, X_test, y_train, y_test, feature_names,
 
             pipe.fit(X_train, y_train)
             preds = pipe.predict(X_test)
+            preds_train = pipe.predict(X_train)
             probs = pipe.predict_proba(X_test) if hasattr(pipe, "predict_proba") else None
 
             accuracy = round(float(accuracy_score(y_test, preds)), 4)
             f1       = round(float(f1_score(y_test, preds, average="weighted", zero_division=0)), 4)
+            accuracy_train = round(float(accuracy_score(y_train, preds_train)), 4)
+            f1_train = round(float(f1_score(y_train, preds_train, average="weighted", zero_division=0)), 4)
             cv_scores = _cv_classification_scores(pipe, X_train, y_train, cfg)
 
             mlflow.log_metric("accuracy", accuracy)
             mlflow.log_metric("f1_score", f1)
+            mlflow.log_metric("train_accuracy", accuracy_train)
+            mlflow.log_metric("train_f1", f1_train)
             for k, v in cv_scores.items():
                 if isinstance(v, float): mlflow.log_metric(k, v)
 
-            result = {"model": name, "accuracy": accuracy, "f1_score": f1,
-                      **{k: v for k, v in cv_scores.items()}}
+            result = {
+                "model": name,
+                "accuracy": accuracy,
+                "f1_score": f1,
+                "train_accuracy": accuracy_train,
+                "train_f1": f1_train,
+                **{k: v for k, v in cv_scores.items()},
+            }
 
             if len(np.unique(y_test)) == 2 and probs is not None:
                 roc_auc = round(float(roc_auc_score(y_test, probs[:, 1])), 4)
@@ -549,7 +579,8 @@ def train_classification_models(X_train, X_test, y_train, y_test, feature_names,
 def train_all(df, target_col, dataset_name, task_type=None,
               hyperparams: dict | None = None,
               selected_models: list[str] | None = None,
-              split_config: dict | None = None):
+              split_config: dict | None = None,
+              progress_callback: Callable[[dict[str, Any]], None] | None = None):
 
     hyperparams = hyperparams or {}
     cfg = split_config_from_dict(split_config)
@@ -558,6 +589,9 @@ def train_all(df, target_col, dataset_name, task_type=None,
         # peek at target to auto-detect before splitting
         y_peek = df[target_col].dropna()
         task_type = detect_task_type(y_peek)
+
+    if progress_callback:
+        progress_callback({"phase": "prepare", "message": "Loading and splitting data…"})
 
     X_train, X_test, y_train, y_test, feature_names, num_cols, cat_cols = load_and_prepare_data(
         df, target_col, cfg, task_type
@@ -573,13 +607,13 @@ def train_all(df, target_col, dataset_name, task_type=None,
         results = train_classification_models(
             X_train, X_test, y_train, y_test, feature_names,
             dataset_name, task_type, hyperparams, selected_models, cfg,
-            num_cols, cat_cols,
+            num_cols, cat_cols, progress_callback=progress_callback,
         )
     else:
         results = train_regression_models(
             X_train, X_test, y_train, y_test, feature_names,
             dataset_name, task_type, hyperparams, selected_models, cfg,
-            num_cols, cat_cols,
+            num_cols, cat_cols, progress_callback=progress_callback,
         )
 
     n_tot = len(X_train) + len(X_test)

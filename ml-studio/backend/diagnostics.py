@@ -17,7 +17,10 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
+from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import learning_curve
+from sklearn.pipeline import Pipeline as SkPipeline
+from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
 
 try:
     from sklearn.calibration import calibration_curve
@@ -73,6 +76,61 @@ def _compute_learning_curve(
             "train_score_mean": np.round(train_m, 4).tolist(),
             "val_score_mean": np.round(val_m, 4).tolist(),
         }
+    except Exception:
+        return None
+
+
+def _subsample_indices(n: int, max_n: int, seed: int = 44) -> np.ndarray:
+    if n <= max_n:
+        return np.arange(n)
+    rng = np.random.RandomState(seed)
+    return np.sort(rng.choice(n, max_n, replace=False))
+
+
+def compute_scaler_baseline_compare(
+    X_train,
+    X_test,
+    y_train,
+    y_test,
+    *,
+    max_rows: int = 8000,
+) -> dict | None:
+    """
+    Fit LinearRegression + each scaler on numeric features only (train-only medians for NaN).
+    For fair comparison with notebook-style workflows; independent of the saved model type.
+    """
+    try:
+        Xtr = X_train.select_dtypes(include=[np.number])
+        Xte = X_test.select_dtypes(include=[np.number])
+        common = [c for c in Xtr.columns if c in Xte.columns]
+        if not common:
+            return None
+        Xtr = Xtr[common].copy()
+        Xte = Xte[common].copy()
+        med = Xtr.median(numeric_only=True)
+        Xtr = Xtr.fillna(med)
+        Xte = Xte.fillna(med)
+        yt_tr = pd.Series(y_train).astype(float).values
+        yt_te = pd.Series(y_test).astype(float).values
+        if len(Xtr) > max_rows:
+            idx = _subsample_indices(len(Xtr), max_rows, 45)
+            Xtr = Xtr.iloc[idx]
+            yt_tr = yt_tr[idx]
+        scalers = [
+            ("standard", StandardScaler()),
+            ("minmax", MinMaxScaler()),
+            ("robust", RobustScaler()),
+        ]
+        rows: list[dict] = []
+        for name, scaler in scalers:
+            pipe = SkPipeline([("scaler", scaler), ("lr", LinearRegression())])
+            pipe.fit(Xtr, yt_tr)
+            pred = pipe.predict(Xte)
+            rmse = float(np.sqrt(mean_squared_error(yt_te, pred)))
+            r2 = float(r2_score(yt_te, pred))
+            rows.append({"scaler": name, "rmse": _json_float(rmse), "r2": _json_float(r2)})
+        best = min(rows, key=lambda r: r["rmse"])
+        return {"comparisons": rows, "best_scaler": best["scaler"]}
     except Exception:
         return None
 
@@ -187,6 +245,24 @@ def compute_diagnostics(
             "counts": hist.tolist(),
             "edges": [round(float(e), 5) for e in edges],
         }
+
+        n_sc = len(yt)
+        idx = _subsample_indices(n_sc, 500, 44)
+        act_s = yt[idx]
+        pred_s = yp[idx]
+        res_s = act_s - pred_s
+        result["predicted_vs_actual"] = {
+            "actual": np.round(act_s, 5).tolist(),
+            "predicted": np.round(pred_s, 5).tolist(),
+        }
+        result["residuals_vs_predicted"] = {
+            "predicted": np.round(pred_s, 5).tolist(),
+            "residuals": np.round(res_s, 5).tolist(),
+        }
+
+        sb = compute_scaler_baseline_compare(X_train, X_test, y_train, y_test)
+        if sb:
+            result["scaler_baseline_compare"] = sb
 
         lc_reg = _compute_learning_curve(
             pipe,

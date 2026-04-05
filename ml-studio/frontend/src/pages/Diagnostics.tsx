@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import {
   getDiagnostics,
@@ -6,6 +6,8 @@ import {
   type DiagnosticsPayload,
   type ExperimentRun,
 } from "../api";
+import { formatRunLabel } from "../lib/runLabel";
+import { ChartExportButtons } from "../components/ChartExportButtons";
 import { LoadingState } from "../components/LoadingState";
 import { PageShell } from "../components/PageShell";
 import { Badge } from "../components/ui/badge";
@@ -16,6 +18,10 @@ import { Select } from "../components/ui/select";
 interface Props {
   datasetId: string | null;
   experimentsSyncKey?: number;
+}
+
+function exportHref(datasetId: string | null) {
+  return datasetId ? `/export?d=${encodeURIComponent(datasetId)}` : "/export";
 }
 
 function formatRegressionMetric(key: string, v: number): string {
@@ -85,6 +91,132 @@ function CalibrationChart({
   );
 }
 
+/** Shared axis scaling so y = x reads as a 45° line on screen. */
+function RegressionScatterChart({
+  title,
+  subtitle,
+  xs,
+  ys,
+  xLabel,
+  yLabel,
+  yEqualsX,
+}: {
+  title: string;
+  subtitle?: string;
+  xs: number[];
+  ys: number[];
+  xLabel: string;
+  yLabel: string;
+  yEqualsX?: boolean;
+}) {
+  const W = 360;
+  const H = 300;
+  const pad = 44;
+  if (!xs.length || xs.length !== ys.length) return null;
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const lo = yEqualsX ? Math.min(minX, minY) : minX;
+  const hi = yEqualsX ? Math.max(maxX, maxY) : maxX;
+  const loY = yEqualsX ? lo : minY;
+  const hiY = yEqualsX ? hi : maxY;
+  const spanX = hi - lo || 1;
+  const spanY = hiY - loY || 1;
+  const sx = (v: number) => pad + ((v - lo) / spanX) * (W - pad * 2);
+  const sy = (v: number) => H - pad - ((v - loY) / spanY) * (H - pad * 2);
+  const diag =
+    yEqualsX ? `${sx(lo)},${sy(lo)} ${sx(hi)},${sy(hi)}` : null;
+  return (
+    <div className="flex flex-col items-center gap-2 w-full">
+      {subtitle && <p className="text-xs text-slate-500 self-start">{subtitle}</p>}
+      <svg width={W} height={H} className="text-slate-300 max-w-full">
+        <rect x={0} y={0} width={W} height={H} fill="#fafafa" rx={8} />
+        {diag && (
+          <polyline fill="none" stroke="#94a3b8" strokeWidth={1} strokeDasharray="5 4" points={diag} />
+        )}
+        <g className="fill-blue-600" fillOpacity={0.35}>
+          {xs.map((xv, i) => (
+            <circle key={i} cx={sx(xv)} cy={sy(ys[i])} r={2.2} />
+          ))}
+        </g>
+        <line x1={pad} y1={H - pad} x2={W - pad} y2={H - pad} stroke="#94a3b8" strokeWidth={1} />
+        <line x1={pad} y1={pad} x2={pad} y2={H - pad} stroke="#94a3b8" strokeWidth={1} />
+        <text x={W / 2} y={H - 8} textAnchor="middle" className="fill-slate-500 text-[10px]">
+          {xLabel}
+        </text>
+        <text x={10} y={H / 2} className="fill-slate-500 text-[10px]" transform={`rotate(-90 10 ${H / 2})`}>
+          {yLabel}
+        </text>
+        <text x={pad + 4} y={pad - 6} className="fill-slate-600 text-[10px] font-medium">
+          {title}
+        </text>
+      </svg>
+    </div>
+  );
+}
+
+function ExportableFigureCard({
+  title,
+  subtitle,
+  filenameSlug,
+  modelName,
+  children,
+  contentClassName,
+}: {
+  title: string;
+  subtitle?: ReactNode;
+  filenameSlug: string;
+  modelName: string;
+  children: React.ReactNode;
+  contentClassName?: string;
+}) {
+  const captureRef = useRef<HTMLDivElement>(null);
+  const base = `diagnostics_${modelName}_${filenameSlug}`;
+  return (
+    <Card>
+      <CardHeader className="flex flex-col gap-2 space-y-0 sm:flex-row sm:items-start sm:justify-between">
+        <div className="space-y-1">
+          <CardTitle className="text-base">{title}</CardTitle>
+          {subtitle ? <div className="text-xs text-slate-500">{subtitle}</div> : null}
+        </div>
+        <ChartExportButtons targetRef={captureRef} filenameBase={base} className="shrink-0" />
+      </CardHeader>
+      <CardContent>
+        <div ref={captureRef} className={contentClassName ?? "w-full rounded-md bg-white p-2"}>
+          {children}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function learningCurveFigureTitle(metric: "accuracy" | "rmse"): string {
+  return metric === "rmse" ? "Learning curve (RMSE)" : "Learning curve (accuracy)";
+}
+
+function LearningCurveHowToRead({ metric }: { metric: "accuracy" | "rmse" }) {
+  const acc = metric === "accuracy";
+  return (
+    <div className="mt-3 max-w-lg mx-auto text-[11px] text-slate-600 leading-relaxed space-y-1.5 border-t border-slate-100 pt-3">
+      <p className="font-semibold text-slate-700">How to read this</p>
+      {acc ? (
+        <>
+          <p>• Both train and validation accuracy stay low → possible <strong>underfitting</strong> (model too simple or weak signal).</p>
+          <p>• Train much higher than validation with a gap that does not shrink → <strong>overfitting</strong> / high variance.</p>
+          <p>• Curves converge as training size grows → more data may yield limited gains.</p>
+        </>
+      ) : (
+        <>
+          <p>• Both train and validation RMSE stay high → possible <strong>underfitting</strong>.</p>
+          <p>• Validation RMSE much worse than train with a persistent gap → variance / <strong>overfitting</strong> risk.</p>
+          <p>• Curves flatten together at larger sample sizes → diminishing returns from more data.</p>
+        </>
+      )}
+    </div>
+  );
+}
+
 function LearningCurveChart(payload: NonNullable<DiagnosticsPayload["learning_curve"]>) {
   const { train_sizes, train_score_mean, val_score_mean, metric } = payload;
   const W = 360;
@@ -140,10 +272,13 @@ function LearningCurveChart(payload: NonNullable<DiagnosticsPayload["learning_cu
 
 export default function Diagnostics({ datasetId, experimentsSyncKey = 0 }: Props) {
   const [runs, setRuns] = useState<ExperimentRun[]>([]);
-  const [model, setModel] = useState<string>("");
+  const [selectedRunId, setSelectedRunId] = useState<string>("");
   const [data, setData] = useState<DiagnosticsPayload | null>(null);
   const [loadingRuns, setLoadingRuns] = useState(false);
   const [loadingDiag, setLoadingDiag] = useState(false);
+
+  const selectedRun = runs.find((r) => r.run_id === selectedRunId);
+  const model = selectedRun?.model ?? "";
 
   useEffect(() => {
     if (!datasetId) return;
@@ -151,18 +286,20 @@ export default function Diagnostics({ datasetId, experimentsSyncKey = 0 }: Props
     getExperiments(datasetId)
       .then((d) => {
         setRuns(d.runs);
-        const unique = d.runs.filter((r, i, a) => a.findIndex((x) => x.model === r.model) === i);
-        setModel((m) => (m && unique.some((r) => r.model === m) ? m : unique[0]?.model ?? ""));
+        setSelectedRunId((id) => {
+          if (id && d.runs.some((r) => r.run_id === id)) return id;
+          return d.runs[0]?.run_id ?? "";
+        });
       })
       .catch(() => toast.error("Could not load experiments."))
       .finally(() => setLoadingRuns(false));
   }, [datasetId, experimentsSyncKey]);
 
   const loadDiag = () => {
-    if (!datasetId || !model) return;
+    if (!datasetId || !model || !selectedRunId) return;
     setLoadingDiag(true);
     setData(null);
-    getDiagnostics(datasetId, model)
+    getDiagnostics(datasetId, model, selectedRunId)
       .then(setData)
       .catch((e: Error) => {
         toast.error(e.message || "Diagnostics failed");
@@ -171,9 +308,9 @@ export default function Diagnostics({ datasetId, experimentsSyncKey = 0 }: Props
   };
 
   useEffect(() => {
-    if (model && datasetId) loadDiag();
+    if (model && selectedRunId && datasetId) loadDiag();
     // eslint-disable-next-line react-hooks/exhaustive-deps -- loadDiag is stable enough for refetch triggers
-  }, [model, datasetId, experimentsSyncKey]);
+  }, [model, selectedRunId, datasetId, experimentsSyncKey]);
 
   if (!datasetId) {
     return (
@@ -199,7 +336,6 @@ export default function Diagnostics({ datasetId, experimentsSyncKey = 0 }: Props
     );
   }
 
-  const uniqueModels = runs.filter((r, i, a) => a.findIndex((x) => x.model === r.model) === i);
   const cm = data?.confusion_matrix;
   const cmMax = cm ? Math.max(...cm.matrix.flat(), 1) : 0;
   const rep = data?.classification_report;
@@ -209,17 +345,17 @@ export default function Diagnostics({ datasetId, experimentsSyncKey = 0 }: Props
   return (
     <PageShell
       title="Diagnostics"
-      description="Hold-out metrics: confusion matrix, ROC, calibration (binary classification), residuals & learning curve (regression), and permutation importance."
+      description="Hold-out metrics with PNG/PDF export per figure. Quick pipeline download below — full joblib + load snippet on Export."
     >
       <div className="mb-6 flex flex-wrap items-end gap-3">
-        <div className="min-w-[200px] flex-1">
-          <label className="mb-1 block text-xs font-medium text-slate-600">Model</label>
+        <div className="min-w-[240px] flex-1 max-w-md">
+          <label className="mb-1 block text-xs font-medium text-slate-600">Run</label>
           <Select
-            value={model}
-            onChange={setModel}
-            options={uniqueModels.map((r) => ({
-              value: r.model,
-              label: r.model.replace(/_/g, " "),
+            value={selectedRunId}
+            onChange={setSelectedRunId}
+            options={runs.map((r) => ({
+              value: r.run_id,
+              label: formatRunLabel(r),
             }))}
           />
         </div>
@@ -233,104 +369,104 @@ export default function Diagnostics({ datasetId, experimentsSyncKey = 0 }: Props
       {!loadingDiag && data?.task_type === "classification" && (
         <div className="space-y-6">
           {cm && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Confusion matrix</CardTitle>
-                <p className="text-xs text-slate-500">Rows = actual, columns = predicted</p>
-              </CardHeader>
-              <CardContent className="overflow-x-auto">
-                <table className="border-collapse text-sm">
-                  <thead>
-                    <tr>
-                      <th className="p-2 border border-slate-200 bg-slate-50" />
-                      {cm.labels.map((l) => (
-                        <th key={l} className="p-2 border border-slate-200 bg-slate-50 font-medium text-slate-700">
-                          {l}
-                        </th>
+            <ExportableFigureCard
+              title="Confusion matrix"
+              subtitle="Rows = actual, columns = predicted"
+              filenameSlug="confusion_matrix"
+              modelName={model}
+              contentClassName="w-full overflow-x-auto rounded-md bg-white p-2"
+            >
+              <table className="border-collapse text-sm">
+                <thead>
+                  <tr>
+                    <th className="p-2 border border-slate-200 bg-slate-50" />
+                    {cm.labels.map((l) => (
+                      <th key={l} className="p-2 border border-slate-200 bg-slate-50 font-medium text-slate-700">
+                        {l}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {cm.matrix.map((row, ri) => (
+                    <tr key={ri}>
+                      <td className="p-2 border border-slate-200 bg-slate-50 font-medium text-slate-700">
+                        {cm.labels[ri]}
+                      </td>
+                      {row.map((cell, ci) => (
+                        <td
+                          key={ci}
+                          className="p-3 border border-slate-200 text-center font-semibold tabular-nums"
+                          style={{ backgroundColor: cmColor(cell, cmMax) }}
+                        >
+                          {cell}
+                        </td>
                       ))}
                     </tr>
-                  </thead>
-                  <tbody>
-                    {cm.matrix.map((row, ri) => (
-                      <tr key={ri}>
-                        <td className="p-2 border border-slate-200 bg-slate-50 font-medium text-slate-700">
-                          {cm.labels[ri]}
-                        </td>
-                        {row.map((cell, ci) => (
-                          <td
-                            key={ci}
-                            className="p-3 border border-slate-200 text-center font-semibold tabular-nums"
-                            style={{ backgroundColor: cmColor(cell, cmMax) }}
-                          >
-                            {cell}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </CardContent>
-            </Card>
+                  ))}
+                </tbody>
+              </table>
+            </ExportableFigureCard>
           )}
 
           {rep && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Classification report</CardTitle>
-              </CardHeader>
-              <CardContent className="overflow-x-auto">
-                <table className="w-full text-xs border border-slate-200 rounded-lg overflow-hidden">
-                  <thead>
-                    <tr className="bg-slate-50 text-slate-600">
-                      <th className="text-left p-2 font-semibold">Class / avg</th>
-                      <th className="p-2 font-semibold">Precision</th>
-                      <th className="p-2 font-semibold">Recall</th>
-                      <th className="p-2 font-semibold">F1</th>
-                      <th className="p-2 font-semibold">Support</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {Object.entries(rep).map(([k, v]) => {
-                      if (typeof v !== "object" || v === null) return null;
-                      const row = v as Record<string, number>;
-                      return (
-                        <tr key={k} className="border-t border-slate-100">
-                          <td className="p-2 font-medium text-slate-800">{k}</td>
-                          <td className="p-2 tabular-nums text-slate-600">{row.precision?.toFixed(3) ?? "—"}</td>
-                          <td className="p-2 tabular-nums text-slate-600">{row.recall?.toFixed(3) ?? "—"}</td>
-                          <td className="p-2 tabular-nums text-slate-600">{row["f1-score"]?.toFixed(3) ?? "—"}</td>
-                          <td className="p-2 tabular-nums text-slate-500">{row.support ?? "—"}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </CardContent>
-            </Card>
+            <ExportableFigureCard
+              title="Classification report"
+              filenameSlug="classification_report"
+              modelName={model}
+              contentClassName="w-full overflow-x-auto rounded-md bg-white p-2"
+            >
+              <table className="w-full text-xs border border-slate-200 rounded-lg overflow-hidden">
+                <thead>
+                  <tr className="bg-slate-50 text-slate-600">
+                    <th className="text-left p-2 font-semibold">Class / avg</th>
+                    <th className="p-2 font-semibold">Precision</th>
+                    <th className="p-2 font-semibold">Recall</th>
+                    <th className="p-2 font-semibold">F1</th>
+                    <th className="p-2 font-semibold">Support</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(rep).map(([k, v]) => {
+                    if (typeof v !== "object" || v === null) return null;
+                    const row = v as Record<string, number>;
+                    return (
+                      <tr key={k} className="border-t border-slate-100">
+                        <td className="p-2 font-medium text-slate-800">{k}</td>
+                        <td className="p-2 tabular-nums text-slate-600">{row.precision?.toFixed(3) ?? "—"}</td>
+                        <td className="p-2 tabular-nums text-slate-600">{row.recall?.toFixed(3) ?? "—"}</td>
+                        <td className="p-2 tabular-nums text-slate-600">{row["f1-score"]?.toFixed(3) ?? "—"}</td>
+                        <td className="p-2 tabular-nums text-slate-500">{row.support ?? "—"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </ExportableFigureCard>
           )}
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {data.roc_curve && (
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-base">ROC curve</CardTitle>
-                  <p className="text-xs text-slate-500">Binary classification; positive class = second label</p>
-                </CardHeader>
-                <CardContent className="flex justify-center">
-                  <RocChart {...data.roc_curve} />
-                </CardContent>
-              </Card>
+              <ExportableFigureCard
+                title="ROC curve"
+                subtitle="Binary classification; positive class = second label"
+                filenameSlug="roc_curve"
+                modelName={model}
+                contentClassName="flex w-full justify-center rounded-md bg-white p-2"
+              >
+                <RocChart {...data.roc_curve} />
+              </ExportableFigureCard>
             )}
             {data.calibration && (
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-base">Calibration</CardTitle>
-                  <p className="text-xs text-slate-500">Predicted probability vs observed frequency</p>
-                </CardHeader>
-                <CardContent className="flex justify-center">
-                  <CalibrationChart {...data.calibration} />
-                </CardContent>
-              </Card>
+              <ExportableFigureCard
+                title="Calibration"
+                subtitle="Predicted probability vs observed frequency"
+                filenameSlug="calibration"
+                modelName={model}
+                contentClassName="flex w-full justify-center rounded-md bg-white p-2"
+              >
+                <CalibrationChart {...data.calibration} />
+              </ExportableFigureCard>
             )}
             {data.roc_auc_macro_ovr != null && !data.roc_curve && (
               <Card>
@@ -345,17 +481,15 @@ export default function Diagnostics({ datasetId, experimentsSyncKey = 0 }: Props
           </div>
 
           {data.learning_curve && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Learning curve (accuracy)</CardTitle>
-                <p className="text-xs text-slate-500">
-                  Training vs 2-fold CV score on growing subsets — gap suggests variance / overfit
-                </p>
-              </CardHeader>
-              <CardContent className="flex justify-center overflow-x-auto">
-                <LearningCurveChart {...data.learning_curve} />
-              </CardContent>
-            </Card>
+            <ExportableFigureCard
+              title="Learning curve (accuracy)"
+              subtitle="Training vs 2-fold CV score on growing subsets — gap suggests variance / overfit"
+              filenameSlug="learning_curve_accuracy"
+              modelName={model}
+              contentClassName="flex w-full justify-center overflow-x-auto rounded-md bg-white p-2"
+            >
+              <LearningCurveChart {...data.learning_curve} />
+            </ExportableFigureCard>
           )}
         </div>
       )}
@@ -374,64 +508,142 @@ export default function Diagnostics({ datasetId, experimentsSyncKey = 0 }: Props
           </div>
 
           {data.residual_histogram && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Residual distribution</CardTitle>
-                <p className="text-xs text-slate-500">Test set: actual − predicted</p>
-              </CardHeader>
-              <CardContent>
-                <div className="flex items-end gap-px h-32">
-                  {data.residual_histogram.counts.map((c, i) => {
-                    const maxC = Math.max(...data.residual_histogram!.counts, 1);
-                    return (
-                      <div key={i} className="flex-1 flex flex-col items-center gap-1 min-w-0">
-                        <div
-                          className="w-full rounded-t bg-blue-500/80 min-h-[2px]"
-                          style={{ height: `${(c / maxC) * 100}%` }}
-                          title={`${data.residual_histogram!.edges[i]?.toFixed(3)} … ${data.residual_histogram!.edges[i + 1]?.toFixed(3)}: ${c}`}
-                        />
-                      </div>
-                    );
-                  })}
-                </div>
-              </CardContent>
-            </Card>
+            <ExportableFigureCard
+              title="Residual distribution"
+              subtitle="Test set: actual − predicted"
+              filenameSlug="residual_histogram"
+              modelName={model}
+              contentClassName="w-full rounded-md bg-white p-2"
+            >
+              <div className="flex h-32 items-end gap-px">
+                {data.residual_histogram.counts.map((c, i) => {
+                  const maxC = Math.max(...data.residual_histogram!.counts, 1);
+                  return (
+                    <div key={i} className="flex min-w-0 flex-1 flex-col items-center gap-1">
+                      <div
+                        className="min-h-[2px] w-full rounded-t bg-blue-500/80"
+                        style={{ height: `${(c / maxC) * 100}%` }}
+                        title={`${data.residual_histogram!.edges[i]?.toFixed(3)} … ${data.residual_histogram!.edges[i + 1]?.toFixed(3)}: ${c}`}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            </ExportableFigureCard>
+          )}
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {data.predicted_vs_actual && (
+              <ExportableFigureCard
+                title="Predicted vs actual"
+                subtitle="Hold-out subsample; dashed line is y = x"
+                filenameSlug="predicted_vs_actual"
+                modelName={model}
+                contentClassName="flex w-full justify-center overflow-x-auto rounded-md bg-white p-2"
+              >
+                <RegressionScatterChart
+                  title="Fit"
+                  xs={data.predicted_vs_actual.predicted}
+                  ys={data.predicted_vs_actual.actual}
+                  xLabel="Predicted"
+                  yLabel="Actual"
+                  yEqualsX
+                />
+              </ExportableFigureCard>
+            )}
+            {data.residuals_vs_predicted && (
+              <ExportableFigureCard
+                title="Residuals vs predicted"
+                subtitle="Look for funnel shape or curvature"
+                filenameSlug="residuals_vs_predicted"
+                modelName={model}
+                contentClassName="flex w-full justify-center overflow-x-auto rounded-md bg-white p-2"
+              >
+                <RegressionScatterChart
+                  title="Residual check"
+                  xs={data.residuals_vs_predicted.predicted}
+                  ys={data.residuals_vs_predicted.residuals}
+                  xLabel="Predicted"
+                  yLabel="Residual"
+                />
+              </ExportableFigureCard>
+            )}
+          </div>
+
+          {data.scaler_baseline_compare && (
+            <ExportableFigureCard
+              title="Linear regression × scaler (baseline)"
+              subtitle={
+                <>
+                  Same numeric features as your pipeline; independent of the selected model. Best by RMSE:{" "}
+                  <span className="font-semibold text-slate-700">{data.scaler_baseline_compare.best_scaler}</span>
+                </>
+              }
+              filenameSlug="scaler_baseline_compare"
+              modelName={model}
+              contentClassName="w-full overflow-x-auto rounded-md bg-white p-2"
+            >
+              <table className="w-full text-sm border border-slate-200 rounded-lg overflow-hidden">
+                <thead>
+                  <tr className="bg-slate-50 text-slate-600">
+                    <th className="text-left p-2 font-semibold">Scaler</th>
+                    <th className="text-right p-2 font-semibold">RMSE</th>
+                    <th className="text-right p-2 font-semibold">R²</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.scaler_baseline_compare.comparisons.map((row) => (
+                    <tr
+                      key={row.scaler}
+                      className={
+                        row.scaler === data.scaler_baseline_compare!.best_scaler
+                          ? "border-t border-slate-100 bg-blue-50/80"
+                          : "border-t border-slate-100"
+                      }
+                    >
+                      <td className="p-2 font-medium text-slate-800">{row.scaler}</td>
+                      <td className="p-2 text-right tabular-nums text-slate-700">{row.rmse.toFixed(4)}</td>
+                      <td className="p-2 text-right tabular-nums text-slate-700">{row.r2.toFixed(4)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </ExportableFigureCard>
           )}
 
           {data.learning_curve && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Learning curve (RMSE)</CardTitle>
-                <p className="text-xs text-slate-500">
-                  Subsampled training data; 2-fold CV — validation above training often means noisy folds or high variance
-                </p>
-              </CardHeader>
-              <CardContent className="flex justify-center overflow-x-auto">
-                <LearningCurveChart {...data.learning_curve} />
-              </CardContent>
-            </Card>
+            <ExportableFigureCard
+              title={learningCurveFigureTitle(data.learning_curve.metric)}
+              subtitle="Subsampled training data; 2-fold CV — validation above training often means noisy folds or high variance"
+              filenameSlug={data.learning_curve.metric === "rmse" ? "learning_curve_rmse" : "learning_curve_accuracy"}
+              modelName={model}
+              contentClassName="flex w-full flex-col justify-center overflow-x-auto rounded-md bg-white p-2"
+            >
+              <LearningCurveChart {...data.learning_curve} />
+              <LearningCurveHowToRead metric={data.learning_curve.metric} />
+            </ExportableFigureCard>
           )}
         </div>
       )}
 
       {!loadingDiag && perm.length > 0 && (
-        <Card className={data ? "mt-6" : ""}>
-          <CardHeader>
-            <CardTitle className="text-base">Permutation importance</CardTitle>
-            <p className="text-xs text-slate-500">
-              Drop in hold-out score when each column is shuffled (top {Math.min(40, perm.length)} features)
-            </p>
-          </CardHeader>
-          <CardContent className="space-y-2">
+        <div className={data ? "mt-6" : ""}>
+          <ExportableFigureCard
+            title="Permutation importance"
+            subtitle={`Drop in hold-out score when each column is shuffled (top ${Math.min(40, perm.length)} features)`}
+            filenameSlug="permutation_importance"
+            modelName={model}
+            contentClassName="w-full space-y-2 rounded-md bg-white p-2"
+          >
             {perm.slice(0, 25).map((p) => (
               <div key={p.feature}>
-                <div className="flex justify-between text-xs mb-0.5">
-                  <span className="font-medium text-slate-700 truncate max-w-[60%]">{p.feature}</span>
+                <div className="mb-0.5 flex justify-between text-xs">
+                  <span className="max-w-[60%] truncate font-medium text-slate-700">{p.feature}</span>
                   <span className="tabular-nums text-slate-500">
                     {p.mean.toFixed(4)} ± {p.std.toFixed(4)}
                   </span>
                 </div>
-                <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
+                <div className="h-2 overflow-hidden rounded-full bg-slate-100">
                   <div
                     className="h-full rounded-full bg-violet-500/90"
                     style={{ width: `${Math.min(100, (p.mean / maxPerm) * 100)}%` }}
@@ -439,8 +651,8 @@ export default function Diagnostics({ datasetId, experimentsSyncKey = 0 }: Props
                 </div>
               </div>
             ))}
-          </CardContent>
-        </Card>
+          </ExportableFigureCard>
+        </div>
       )}
     </PageShell>
   );

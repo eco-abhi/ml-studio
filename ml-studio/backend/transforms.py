@@ -8,10 +8,10 @@ Supported steps:
   {"type": "impute",         "columns": [...], "strategy": "mean|median|mode|zero"}
   {"type": "one_hot_encode", "columns": [...]}
   {"type": "label_encode",   "columns": [...]}
-  {"type": "clip_outliers",  "columns": [...], "method": "iqr|zscore"}
+  {"type": "clip_outliers",  "columns": [...], "method": "iqr|zscore|percentile", "p_low": 0.01, "p_high": 0.99}
   {"type": "scale",          "columns": [...], "method": "standard|minmax|robust"}
   {"type": "rename_columns",    "mapping": {"old_name": "new_name", ...}}
-  {"type": "math_transform",   "columns": [...], "method": "log1p|sqrt|square|reciprocal|abs"}
+  {"type": "math_transform",   "columns": [...], "method": "log1p|sqrt|square|reciprocal|abs", "output_mode": "replace|new_columns"}
   {"type": "fix_skewness",     "columns": [...], "method": "auto|log1p|sqrt|box_cox|yeo_johnson", "threshold": 0.5}
   {"type": "bin_numeric",      "columns": [...], "n_bins": 5, "strategy": "equal_width|quantile"}
   {"type": "drop_duplicates",  "columns": [...], "keep": "first|last|none"}   # columns=[] → all
@@ -64,6 +64,61 @@ def _stratify_ok_for_split(y: pd.Series) -> bool:
     return True
 
 
+def apply_holdout_split_to_df(df: pd.DataFrame, spec: dict) -> pd.DataFrame:
+    """
+    Add ML_PIPELINE_SPLIT_COL with 'train' / 'test' labels (same semantics as the former transform step).
+    spec: target_column (required), test_size, random_state, shuffle, stratify.
+    Rows with null target are left NaN in the split column.
+    """
+    target = spec.get("target_column")
+    if not target or target not in df.columns:
+        raise ValueError("Hold-out split requires target_column to exist in the dataframe.")
+
+    test_size = float(spec.get("test_size", 0.2))
+    test_size = min(0.95, max(0.05, test_size))
+    random_state = spec.get("random_state", 42)
+    try:
+        random_state = int(random_state)
+    except (TypeError, ValueError):
+        random_state = 42
+    shuffle = bool(spec.get("shuffle", True))
+    stratify_flag = bool(spec.get("stratify", True))
+
+    df = df.copy()
+    if ML_PIPELINE_SPLIT_COL in df.columns:
+        df = df.drop(columns=[ML_PIPELINE_SPLIT_COL])
+
+    usable = df.dropna(subset=[target])
+    if len(usable) < 2:
+        raise ValueError("Need at least 2 rows with a non-null target to assign train/test split.")
+
+    idx = usable.index.to_numpy()
+    y_sub = usable[target]
+    strat = None
+    if stratify_flag and _stratify_ok_for_split(y_sub):
+        strat = y_sub
+
+    try:
+        idx_train, idx_test = sk_train_test_split(
+            idx,
+            test_size=test_size,
+            random_state=random_state if shuffle else None,
+            shuffle=shuffle,
+            stratify=strat,
+        )
+    except ValueError as e:
+        raise ValueError(
+            "Train/test split failed (try disabling stratify or check class counts). "
+            f"Details: {str(e)}"
+        ) from e
+
+    lab = pd.Series(index=df.index, dtype=object)
+    lab.loc[idx_train] = "train"
+    lab.loc[idx_test] = "test"
+    df[ML_PIPELINE_SPLIT_COL] = lab
+    return df
+
+
 def apply_transforms(df: pd.DataFrame, steps: list[dict]) -> pd.DataFrame:
     df = df.copy()
     for step in steps:
@@ -96,6 +151,12 @@ def apply_transforms(df: pd.DataFrame, steps: list[dict]) -> pd.DataFrame:
 
         elif kind == "clip_outliers":
             method = step.get("method", "iqr")
+            p_low = float(step.get("p_low", 0.01))
+            p_high = float(step.get("p_high", 0.99))
+            p_low = max(0.0, min(p_low, 0.5))
+            p_high = max(0.5, min(p_high, 1.0))
+            if p_low >= p_high:
+                p_low, p_high = 0.01, 0.99
             for col in cols:
                 if not pd.api.types.is_numeric_dtype(df[col]):
                     continue
@@ -107,6 +168,10 @@ def apply_transforms(df: pd.DataFrame, steps: list[dict]) -> pd.DataFrame:
                     mean, std = df[col].mean(), df[col].std()
                     if std > 0:
                         df[col] = df[col].clip(mean - 3 * std, mean + 3 * std)
+                elif method == "percentile":
+                    lo = df[col].quantile(p_low)
+                    hi = df[col].quantile(p_high)
+                    df[col] = df[col].clip(lower=lo, upper=hi)
 
         elif kind == "scale":
             method = step.get("method", "standard")
@@ -126,19 +191,31 @@ def apply_transforms(df: pd.DataFrame, steps: list[dict]) -> pd.DataFrame:
 
         elif kind == "math_transform":
             method = step.get("method", "log1p")
+            output_mode = step.get("output_mode", "replace")
+            new_cols = output_mode == "new_columns"
             for col in cols:
                 if not pd.api.types.is_numeric_dtype(df[col]):
                     continue
+                src = df[col]
                 if method == "log1p":
-                    df[col] = np.log1p(df[col].clip(lower=0))
+                    out = np.log1p(src.clip(lower=0))
                 elif method == "sqrt":
-                    df[col] = np.sqrt(df[col].clip(lower=0))
+                    out = np.sqrt(src.clip(lower=0))
                 elif method == "square":
-                    df[col] = df[col] ** 2
+                    out = src ** 2
                 elif method == "reciprocal":
-                    df[col] = 1.0 / df[col].replace(0, np.nan)
+                    out = 1.0 / src.replace(0, np.nan)
                 elif method == "abs":
-                    df[col] = df[col].abs()
+                    out = src.abs()
+                else:
+                    continue
+                if new_cols:
+                    suffix = {"log1p": "log1p", "sqrt": "sqrt", "square": "sq", "reciprocal": "inv", "abs": "abs"}.get(
+                        method, method
+                    )
+                    df[f"{suffix}_{col}"] = out
+                else:
+                    df[col] = out
 
         elif kind == "fix_skewness":
             method = step.get("method", "auto")
@@ -353,55 +430,17 @@ def apply_transforms(df: pd.DataFrame, steps: list[dict]) -> pd.DataFrame:
                     pass
 
         elif kind == "train_test_split":
-            target = step.get("target_column")
-            if not target or target not in df.columns:
-                raise ValueError(
-                    "train_test_split requires target_column to exist in the dataframe."
-                )
-            test_size = float(step.get("test_size", 0.2))
-            test_size = min(0.95, max(0.05, test_size))
-            random_state = step.get("random_state", 42)
-            try:
-                random_state = int(random_state)
-            except (TypeError, ValueError):
-                random_state = 42
-            shuffle = bool(step.get("shuffle", True))
-            stratify_flag = bool(step.get("stratify", True))
-
-            if ML_PIPELINE_SPLIT_COL in df.columns:
-                df = df.drop(columns=[ML_PIPELINE_SPLIT_COL])
-
-            usable = df.dropna(subset=[target])
-            if len(usable) < 2:
-                raise ValueError(
-                    "Need at least 2 rows with a non-null target to assign train/test split."
-                )
-
-            idx = usable.index.to_numpy()
-            y_sub = usable[target]
-            strat = None
-            if stratify_flag and _stratify_ok_for_split(y_sub):
-                strat = y_sub
-
-            try:
-                idx_train, idx_test = sk_train_test_split(
-                    idx,
-                    test_size=test_size,
-                    random_state=random_state if shuffle else None,
-                    shuffle=shuffle,
-                    stratify=strat,
-                )
-            except ValueError as e:
-                raise ValueError(
-                    "Train/test split failed (try disabling stratify or check class counts). "
-                    f"Details: {str(e)}"
-                ) from e
-
-            df = df.copy()
-            lab = pd.Series(index=df.index, dtype=object)
-            lab.loc[idx_train] = "train"
-            lab.loc[idx_test] = "test"
-            df[ML_PIPELINE_SPLIT_COL] = lab
+            # Legacy pipelines only — new UIs use the Split tab.
+            df = apply_holdout_split_to_df(
+                df,
+                {
+                    "target_column": step.get("target_column"),
+                    "test_size": step.get("test_size", 0.2),
+                    "random_state": step.get("random_state", 42),
+                    "shuffle": step.get("shuffle", True),
+                    "stratify": step.get("stratify", True),
+                },
+            )
 
     return df
 

@@ -9,6 +9,7 @@ import {
   type PredictionResult,
   type TaskType,
 } from "../api";
+import { compactRunLabel, formatRunLabel } from "../lib/runLabel";
 import { LoadingState } from "../components/LoadingState";
 import { PageShell } from "../components/PageShell";
 import { Badge } from "../components/ui/badge";
@@ -18,7 +19,11 @@ import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
 const COLORS = ["#3b82f6","#10b981","#f59e0b","#ef4444","#8b5cf6","#06b6d4","#ec4899","#84cc16"];
 
 interface FeatureMeta { min: number; max: number; mean: number }
-interface AllResult extends PredictionResult { model: string; error?: boolean }
+interface AllResult extends PredictionResult {
+  model: string;
+  run_id: string;
+  error?: boolean;
+}
 interface Props {
   datasetId: string | null;
   experimentsSyncKey?: number;
@@ -26,7 +31,7 @@ interface Props {
 
 export default function Predict({ datasetId, experimentsSyncKey = 0 }: Props) {
   const [runs, setRuns] = useState<ExperimentRun[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [features, setFeatures] = useState<Record<string, number>>({});
   const [meta, setMeta] = useState<Record<string, FeatureMeta>>({});
   const [order, setOrder] = useState<string[]>([]);
@@ -42,7 +47,7 @@ export default function Predict({ datasetId, experimentsSyncKey = 0 }: Props) {
     Promise.all([getExperiments(datasetId), getEDA(datasetId)]).then(([exp, eda]) => {
       setRuns(exp.runs);
       if (exp.runs[0]) {
-        setSelected(exp.runs[0].model);
+        setSelectedRunId(exp.runs[0].run_id);
         setTaskType("accuracy" in exp.runs[0] ? "classification" : "regression");
       }
       const m: Record<string, FeatureMeta> = {};
@@ -55,11 +60,13 @@ export default function Predict({ datasetId, experimentsSyncKey = 0 }: Props) {
     });
   }, [datasetId, experimentsSyncKey]);
 
+  const selectedRun = runs.find((r) => r.run_id === selectedRunId);
+
   const handlePredict = async () => {
-    if (!selected || !datasetId) return;
+    if (!selectedRun || !datasetId) return;
     try {
       setLoading(true); setResult(null);
-      const r = await predict(datasetId, selected, features);
+      const r = await predict(datasetId, selectedRun.model, features, selectedRun.run_id);
       setResult(r);
     } catch (e) { toast.error("Prediction failed: " + (e as Error).message); }
     finally { setLoading(false); }
@@ -71,9 +78,15 @@ export default function Predict({ datasetId, experimentsSyncKey = 0 }: Props) {
       setLoadingAll(true); setAllResults(null);
       const results = await Promise.all(
         runs.map((r) =>
-          predict(datasetId, r.model, features)
-            .then((res): AllResult => ({ model: r.model, ...res }))
-            .catch((): AllResult => ({ model: r.model, prediction: null, confidence: null, error: true }))
+          predict(datasetId, r.model, features, r.run_id)
+            .then((res): AllResult => ({ model: r.model, run_id: r.run_id, ...res }))
+            .catch((): AllResult => ({
+              model: r.model,
+              run_id: r.run_id,
+              prediction: null,
+              confidence: null,
+              error: true,
+            }))
         )
       );
       setAllResults(results);
@@ -87,7 +100,7 @@ export default function Predict({ datasetId, experimentsSyncKey = 0 }: Props) {
     setFeatures(d); setResult(null); setAllResults(null);
   };
 
-  const modelColor = (m: string) => COLORS[runs.findIndex((r) => r.model === m) % COLORS.length];
+  const modelColor = (runId: string) => COLORS[runs.findIndex((r) => r.run_id === runId) % COLORS.length];
 
   if (!datasetId) return <Empty />;
   if (!init) {
@@ -161,15 +174,17 @@ export default function Predict({ datasetId, experimentsSyncKey = 0 }: Props) {
           <Card>
             <CardContent className="pt-5 space-y-3">
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1.5">Model</label>
+                <label className="block text-sm font-medium text-slate-700 mb-1.5">Run</label>
                 <select
-                  value={selected ?? ""}
-                  onChange={(e) => setSelected(e.target.value)}
+                  value={selectedRunId ?? ""}
+                  onChange={(e) => setSelectedRunId(e.target.value || null)}
                   className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 >
-                  {runs
-                    .filter((r, i, arr) => arr.findIndex((x) => x.model === r.model) === i)
-                    .map((r) => <option key={r.run_id} value={r.model}>{r.model.replace(/_/g, " ")}</option>)}
+                  {runs.map((r) => (
+                    <option key={r.run_id} value={r.run_id}>
+                      {formatRunLabel(r)}
+                    </option>
+                  ))}
                 </select>
               </div>
               <Button onClick={handlePredict} disabled={loading} className="w-full">
@@ -196,7 +211,9 @@ export default function Predict({ datasetId, experimentsSyncKey = 0 }: Props) {
           {result && !allResults && (
             <Card className="border-emerald-200 bg-emerald-50">
               <CardContent className="pt-5">
-                <p className="text-xs text-emerald-600 font-medium">{selected?.replace(/_/g, " ")} prediction</p>
+                <p className="text-xs text-emerald-600 font-medium">
+                  {selectedRun ? formatRunLabel(selectedRun) : "Prediction"}
+                </p>
                 <p className="text-4xl font-bold text-emerald-800 mt-1 tabular-nums">
                   {result.prediction !== null
                     ? typeof result.prediction === "number"
@@ -218,18 +235,20 @@ export default function Predict({ datasetId, experimentsSyncKey = 0 }: Props) {
             <Card>
               <CardHeader><CardTitle>All model predictions</CardTitle></CardHeader>
               <CardContent className="space-y-3">
-                {allResults.map((res, i) => {
+                {allResults.map((res) => {
                   const val = res.prediction;
                   const isNum = typeof val === "number";
                   const pct = isNum && numPreds.length > 1
                     ? (((val as number) - predMin) / spread) * 80 + 10
                     : 50;
-                  const c = modelColor(res.model);
+                  const c = modelColor(res.run_id);
                   return (
-                    <div key={`${res.model}-${i}`} className="flex items-center gap-2">
-                      <div className="flex items-center gap-1.5 w-40 shrink-0">
+                    <div key={res.run_id} className="flex items-center gap-2">
+                      <div className="flex items-center gap-1.5 w-48 shrink-0 min-w-0">
                         <span className="w-2 h-2 rounded-full shrink-0" style={{ background: c }} />
-                        <span className="text-xs text-slate-600 truncate">{res.model.replace(/_/g, " ")}</span>
+                        <span className="text-xs text-slate-600 truncate" title={res.run_id}>
+                          {compactRunLabel({ model: res.model, run_id: res.run_id })}
+                        </span>
                       </div>
                       {isNum && taskType === "regression" ? (
                         <>

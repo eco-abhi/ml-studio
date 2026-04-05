@@ -1,7 +1,12 @@
+import json
 import logging
 import os
+import queue
+import re
+import threading
 import uuid
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 import mlflow
@@ -13,7 +18,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 
 import db
 from eda import (
@@ -34,7 +39,14 @@ from diagnostics import compute_diagnostics
 from predict import get_feature_importances, load_model, run_prediction
 from train import CLASSIFICATION_MODELS, REGRESSION_MODELS, detect_task_type, load_and_prepare_data, train_all
 from tune import run_tuning
-from transforms import apply_transforms, preview_transforms, validate_transform_steps
+from transforms import (
+    ML_PIPELINE_SPLIT_COL,
+    apply_holdout_split_to_df,
+    apply_transforms,
+    preview_transforms,
+    validate_transform_steps,
+)
+from mlflow_tracking import configure_mlflow_tracking
 from url_safety import fetch_url_bytes
 
 load_dotenv()
@@ -51,35 +63,9 @@ def _public_error_detail(exc: Exception) -> str:
     return str(exc) if expose else "Request failed"
 
 # ── MLflow tracking URI ───────────────────────────────────────────────────────
-# Order: MLFLOW_TRACKING_URI → DagHub → sqlite at a stable path (backend/mlruns.db).
-# Relative sqlite:///mlruns.db breaks when the API cwd ≠ where you run `mlflow ui`.
+# Resolved in mlflow_tracking.configure_mlflow_tracking (shared with mlflow-ui CLI).
 
-
-def _configure_mlflow_tracking() -> tuple[str, bool]:
-    """Return (tracking_uri, is_remote_http)."""
-    explicit = os.getenv("MLFLOW_TRACKING_URI", "").strip()
-    if explicit:
-        return explicit, explicit.lower().startswith(("http://", "https://"))
-
-    dag = os.getenv("DAGSHUB_MLFLOW_URI", "").strip()
-    token = os.getenv("DAGSHUB_TOKEN", "").strip()
-    if dag and token:
-        os.environ["MLFLOW_TRACKING_USERNAME"] = token
-        os.environ["MLFLOW_TRACKING_PASSWORD"] = token
-        return dag, True
-
-    custom = os.getenv("MLFLOW_SQLITE_PATH", "").strip()
-    if custom:
-        db_path = Path(custom).expanduser().resolve()
-    else:
-        db_path = (Path(__file__).resolve().parent / "mlruns.db").resolve()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    # SQLAlchemy absolute POSIX path: sqlite:////abs/path (three slashes + path starting with /)
-    uri = "sqlite:///" + db_path.as_posix()
-    return uri, False
-
-
-_MLFLOW_URI, _MLFLOW_IS_REMOTE = _configure_mlflow_tracking()
+_MLFLOW_URI, _MLFLOW_IS_REMOTE = configure_mlflow_tracking()
 mlflow.set_tracking_uri(_MLFLOW_URI)
 log.info("MLflow tracking URI: %s", _MLFLOW_URI)
 
@@ -130,6 +116,33 @@ def _load_eda_df(dataset: dict, data_source: str | None) -> pd.DataFrame:
     if data_source and str(data_source).lower() == "original":
         return db.download_df(dataset["storage_path"])
     return _load_df(dataset)
+
+
+def _df_for_transform_work(dataset: dict, *, from_original: bool) -> pd.DataFrame:
+    """Base dataframe for transform preview/apply. From-original reapplies saved hold-out split before steps."""
+    if from_original:
+        df = db.download_df(dataset["storage_path"])
+        hs = dataset.get("holdout_split")
+        if isinstance(hs, dict) and hs.get("target_column"):
+            df = apply_holdout_split_to_df(df, hs)
+        return df
+    return _load_df(dataset)
+
+
+def _gate_transforms_need_holdout_column(dataset: dict, df: pd.DataFrame, steps: list | None = None) -> None:
+    """Require Split tab once before transforms when no working CSV exists yet (grandfather old datasets)."""
+    if not steps:
+        return
+    if ML_PIPELINE_SPLIT_COL in df.columns:
+        return
+    if dataset.get("transformed_path"):
+        return
+    if any(s.get("type") == "train_test_split" for s in steps):
+        return
+    raise HTTPException(
+        status_code=400,
+        detail="Open the Split tab and assign train/test labels before applying transforms.",
+    )
 
 
 # ── Upload / preview ──────────────────────────────────────────────────────────
@@ -205,6 +218,14 @@ class TrainRequest(BaseModel):
     split_config: dict = Field(default_factory=dict)
 
 
+class HoldoutSplitBody(BaseModel):
+    target_column: str
+    test_size: float = Field(default=0.2, ge=0.05, le=0.95)
+    random_state: int = 42
+    shuffle: bool = True
+    stratify: bool = True
+
+
 @app.post("/train/{dataset_id}")
 def train_models(dataset_id: str, target_col: str, task_type: str = None,
                  body: TrainRequest = TrainRequest()):
@@ -234,6 +255,76 @@ def train_models(dataset_id: str, target_col: str, task_type: str = None,
     except Exception as e:
         log.exception("Request failed")
         raise HTTPException(status_code=400, detail=_public_error_detail(e))
+
+
+@app.post("/train/{dataset_id}/stream")
+def train_models_stream(
+    dataset_id: str,
+    target_col: str,
+    task_type: str = None,
+    body: TrainRequest = TrainRequest(),
+):
+    """Same training as POST /train/{id}, but emits NDJSON progress lines then a final result."""
+    try:
+        dataset = _require_dataset(dataset_id)
+    except HTTPException:
+        raise
+    df = _load_df(dataset)
+    if task_type is None:
+        task_type = detect_task_type(df[target_col])
+
+    q: queue.Queue[str | None] = queue.Queue()
+    result_holder: list = []
+
+    def progress(ev: dict) -> None:
+        q.put(json.dumps(ev) + "\n")
+
+    def worker() -> None:
+        try:
+            out = train_all(
+                df,
+                target_col,
+                dataset_id,
+                task_type,
+                hyperparams=body.hyperparams,
+                selected_models=body.models or None,
+                split_config=body.split_config or {},
+                progress_callback=progress,
+            )
+            result_holder.append(out)
+            q.put(json.dumps({"phase": "complete", "result": out}, default=str) + "\n")
+        except Exception as e:
+            log.exception("Train stream failed")
+            q.put(json.dumps({"phase": "error", "detail": _public_error_detail(e)}) + "\n")
+        finally:
+            q.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def gen():
+        try:
+            while True:
+                line = q.get()
+                if line is None:
+                    break
+                yield line
+            if result_holder:
+                out = result_holder[0]
+                db.upsert_dataset(
+                    dataset_id,
+                    {
+                        **dataset,
+                        "task_type": out["task_type"],
+                        "target_col": target_col,
+                        "features": out["feature_names"],
+                        "split_config": out["split_config"],
+                    },
+                )
+        except Exception:
+            log.exception("Train stream generator")
+            raise
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 # ── Experiments ───────────────────────────────────────────────────────────────
@@ -272,7 +363,12 @@ def get_experiments(dataset_id: str):
                 "params":     numeric_params,
                 "started_at": r.info.start_time,
             }
-            for metric in ["rmse", "mae", "r2", "cv_rmse", "accuracy", "f1_score", "roc_auc"]:
+            for metric in [
+                "rmse", "mae", "r2", "cv_rmse",
+                "train_rmse", "train_mae", "train_r2",
+                "accuracy", "f1_score", "roc_auc",
+                "train_accuracy", "train_f1",
+            ]:
                 if metric in r.data.metrics:
                     run_data[metric] = r.data.metrics[metric]
             result_runs.append(run_data)
@@ -288,7 +384,7 @@ def get_experiments(dataset_id: str):
 # ── Feature importances ───────────────────────────────────────────────────────
 
 @app.get("/diagnostics/{dataset_id}/{model_name}")
-def get_model_diagnostics(dataset_id: str, model_name: str):
+def get_model_diagnostics(dataset_id: str, model_name: str, run_id: str | None = None):
     """Confusion matrix / ROC / calibration (classification), residuals & learning curve (regression), permutation importance."""
     try:
         dataset = _require_dataset(dataset_id)
@@ -296,7 +392,7 @@ def get_model_diagnostics(dataset_id: str, model_name: str):
             raise HTTPException(status_code=400, detail="Train on this dataset before running diagnostics.")
 
         df = _load_df(dataset)
-        pipe = load_model(model_name, dataset_id)
+        pipe = load_model(model_name, dataset_id, run_id=run_id)
         if pipe is None:
             raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
 
@@ -319,14 +415,14 @@ def get_model_diagnostics(dataset_id: str, model_name: str):
 
 
 @app.get("/importances/{dataset_id}/{model_name}")
-def get_importances(dataset_id: str, model_name: str):
+def get_importances(dataset_id: str, model_name: str, run_id: str | None = None):
     try:
         dataset = _require_dataset(dataset_id)
         if "target_col" not in dataset:
             raise HTTPException(status_code=400, detail="Model not yet trained on this dataset")
 
         df = _load_df(dataset)
-        pipe = load_model(model_name, dataset_id)
+        pipe = load_model(model_name, dataset_id, run_id=run_id)
         if pipe is None:
             raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
 
@@ -345,16 +441,53 @@ def get_importances(dataset_id: str, model_name: str):
         raise HTTPException(status_code=400, detail=_public_error_detail(e))
 
 
+_MODEL_FILE_SAFE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+@app.get("/export/{dataset_id}/{model_name}/pipeline.joblib")
+def download_trained_pipeline(dataset_id: str, model_name: str, run_id: str | None = None):
+    """Serialize the latest MLflow sklearn pipeline for this dataset + model as joblib (gzip)."""
+    try:
+        import joblib
+
+        dataset = _require_dataset(dataset_id)
+        if "target_col" not in dataset:
+            raise HTTPException(
+                status_code=400,
+                detail="Train on this dataset before exporting a pipeline.",
+            )
+        pipe = load_model(model_name, dataset_id, run_id=run_id)
+        if pipe is None:
+            raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+
+        buf = BytesIO()
+        joblib.dump(pipe, buf, compress=("gzip", 3))
+        buf.seek(0)
+        safe = _MODEL_FILE_SAFE.sub("_", model_name).strip("._-") or "pipeline"
+        suffix = f"_{run_id.strip()[:8]}" if run_id and run_id.strip() else ""
+        filename = f"{safe}_pipeline{suffix}.joblib"
+        return StreamingResponse(
+            buf,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Pipeline export failed")
+        raise HTTPException(status_code=400, detail=_public_error_detail(e))
+
+
 # ── Predict ───────────────────────────────────────────────────────────────────
 
 @app.post("/predict/{dataset_id}/{model_name}")
-def predict(dataset_id: str, model_name: str, data: dict):
+def predict(dataset_id: str, model_name: str, data: dict, run_id: str | None = None):
     try:
         dataset = _require_dataset(dataset_id)
         if "target_col" not in dataset:
             raise HTTPException(status_code=400, detail="Model not yet trained on this dataset")
 
-        pipe = load_model(model_name, dataset_id)
+        pipe = load_model(model_name, dataset_id, run_id=run_id)
         if pipe is None:
             raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
 
@@ -530,14 +663,12 @@ def transform_preview(dataset_id: str, body: dict):
     try:
         dataset = _require_dataset(dataset_id)
         from_original = body.get("from_original", False)
-        if from_original:
-            df = db.download_df(dataset["storage_path"])
-        else:
-            df = _load_df(dataset)
+        df = _df_for_transform_work(dataset, from_original=from_original)
         steps = body.get("steps", [])
         existing = dataset.get("transform_steps", [])
         all_steps = steps if from_original else existing + steps
         validate_transform_steps(all_steps)
+        _gate_transforms_need_holdout_column(dataset, df, steps)
         return preview_transforms(df, steps, n=body.get("n", 5))
     except HTTPException:
         raise
@@ -558,11 +689,8 @@ def transform_apply(dataset_id: str, body: dict):
         existing_steps = dataset.get("transform_steps", [])
         all_steps = steps if from_original else existing_steps + steps
         validate_transform_steps(all_steps)
-        # Load from original if requested (used for individual step revert)
-        if from_original:
-            df = db.download_df(dataset["storage_path"])
-        else:
-            df = _load_df(dataset)
+        df = _df_for_transform_work(dataset, from_original=from_original)
+        _gate_transforms_need_holdout_column(dataset, df, steps)
         transformed = apply_transforms(df, steps)
 
         # Persist the transformed CSV
@@ -627,6 +755,82 @@ def transform_reset(dataset_id: str):
         raise HTTPException(status_code=400, detail=_public_error_detail(e))
 
 
+@app.get("/datasets/{dataset_id}/holdout-split")
+def get_holdout_split_status(dataset_id: str):
+    """Return saved hold-out config and whether __ml_split__ is present on the active dataframe."""
+    try:
+        dataset = _require_dataset(dataset_id)
+        cfg = dataset.get("holdout_split")
+        df = _load_df(dataset)
+        has_col = ML_PIPELINE_SPLIT_COL in df.columns
+        counts = None
+        if has_col and len(df.index) > 0:
+            vc = df[ML_PIPELINE_SPLIT_COL].value_counts()
+            counts = {"train": int(vc.get("train", 0)), "test": int(vc.get("test", 0))}
+        return {
+            "configured": bool(isinstance(cfg, dict) and cfg.get("target_column")),
+            "config": cfg if isinstance(cfg, dict) else None,
+            "column_present": has_col,
+            "counts": counts,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Request failed")
+        raise HTTPException(status_code=400, detail=_public_error_detail(e))
+
+
+@app.post("/datasets/{dataset_id}/holdout-split")
+def save_holdout_split(dataset_id: str, body: HoldoutSplitBody):
+    """
+    Assign __ml_split__ on a copy of the original upload and set it as the working dataset.
+    Clears the transform pipeline so preprocessing always runs after the hold-out is fixed.
+    """
+    try:
+        dataset = _require_dataset(dataset_id)
+        df = db.download_df(dataset["storage_path"])
+        if body.target_column not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Target column '{body.target_column}' not found")
+
+        spec = {
+            "target_column": body.target_column,
+            "test_size": body.test_size,
+            "random_state": body.random_state,
+            "shuffle": body.shuffle,
+            "stratify": body.stratify,
+        }
+        try:
+            out = apply_holdout_split_to_df(df, spec)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        csv_bytes = out.to_csv(index=False).encode()
+        transformed_path = db.upload_csv(dataset_id, csv_bytes, "transformed.csv")
+        from datetime import datetime as _dt
+
+        vc = out[ML_PIPELINE_SPLIT_COL].value_counts()
+        db.upsert_dataset(dataset_id, {
+            **dataset,
+            "transformed_path":     transformed_path,
+            "columns":              out.columns.tolist(),
+            "shape":                list(out.shape),
+            "dtypes":               {col: str(out[col].dtype) for col in out.columns},
+            "transform_steps":      [],
+            "transform_applied_at": _dt.now().isoformat(),
+            "holdout_split":        spec,
+        })
+        return {
+            "shape":   list(out.shape),
+            "columns": out.columns.tolist(),
+            "counts":  {"train": int(vc.get("train", 0)), "test": int(vc.get("test", 0))},
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Request failed")
+        raise HTTPException(status_code=400, detail=_public_error_detail(e))
+
+
 # ── Misc ──────────────────────────────────────────────────────────────────────
 
 @app.post("/tune/{dataset_id}")
@@ -666,17 +870,29 @@ def list_datasets():
 def mlflow_info():
     uri = mlflow.get_tracking_uri()
     is_remote = uri.lower().startswith(("http://", "https://"))
-    ui_url = uri if is_remote else "http://localhost:5000"
+    ui_url = uri if is_remote else "http://127.0.0.1:5000"
     local_ui_command = None
+    local_tracking_note = None
+    local_ui_command_uv = None
     if not is_remote:
         # Quote for POSIX shells; Windows users can paste URI without quotes if needed.
         safe = uri.replace('"', '\\"')
-        local_ui_command = f'mlflow ui --backend-store-uri "{safe}" --port 5000'
+        # Must match this URI: plain `mlflow ui` defaults to ./mlruns (file store) and is a different database.
+        local_ui_command = f'mlflow ui --backend-store-uri "{safe}" --host 127.0.0.1 --port 5000'
+        local_ui_command_uv = "uv run python mlflow_ui_cli.py"
+        local_tracking_note = (
+            "This API logs runs to the URI above. If you start the UI without --backend-store-uri, "
+            "MLflow uses a separate ./mlruns folder from your shell’s current directory, so you will not see "
+            "these runs and you may get errors about missing meta.yaml or “Malformed run 'models'”. "
+            "From the backend folder, prefer: uv run python mlflow_ui_cli.py"
+        )
     return {
         "tracking_uri": uri,
         "ui_url":       ui_url,
         "is_remote":    is_remote,
         "local_ui_command": local_ui_command,
+        "local_ui_command_uv": local_ui_command_uv,
+        "local_tracking_note": local_tracking_note,
     }
 
 

@@ -4,8 +4,8 @@ import pandas as pd
 import numpy as np
 
 
-def load_model(model_name: str, dataset_name: str):
-    """Load the most recent run artifact for this dataset+model combo."""
+def load_model(model_name: str, dataset_name: str, run_id: str | None = None):
+    """Load sklearn pipeline from MLflow: specific run_id, or latest run for dataset+model."""
     client = mlflow.tracking.MlflowClient()
     exp_name = f"dataset-{dataset_name}"
     try:
@@ -14,6 +14,22 @@ def load_model(model_name: str, dataset_name: str):
             return None
     except Exception:
         return None
+
+    if run_id:
+        run_id = run_id.strip()
+        try:
+            run = client.get_run(run_id)
+        except Exception:
+            return None
+        if run.info.experiment_id != exp.experiment_id:
+            return None
+        if run.data.params.get("model") != model_name:
+            return None
+        model_uri = f"runs:/{run_id}/model"
+        try:
+            return mlflow.sklearn.load_model(model_uri)
+        except Exception:
+            return None
 
     runs = client.search_runs(
         exp.experiment_id,
@@ -24,8 +40,8 @@ def load_model(model_name: str, dataset_name: str):
     if not runs:
         return None
 
-    run_id = runs[0].info.run_id
-    model_uri = f"runs:/{run_id}/model"
+    rid = runs[0].info.run_id
+    model_uri = f"runs:/{rid}/model"
     try:
         return mlflow.sklearn.load_model(model_uri)
     except Exception:

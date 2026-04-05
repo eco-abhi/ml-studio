@@ -34,12 +34,17 @@ export interface ModelResult {
   rmse?:        number;
   mae?:         number;
   r2?:          number;
+  train_rmse?:  number;
+  train_mae?:   number;
+  train_r2?:    number;
   cv_rmse?:     number;
   cv_mae?:      number;
   cv_r2?:       number;
   // classification
   accuracy?:    number;
   f1_score?:    number;
+  train_accuracy?: number;
+  train_f1?:    number;
   roc_auc?:     number;
   cv_accuracy?: number;
   cv_f1?:       number;
@@ -255,15 +260,93 @@ export const trainModels = (
   })).then((r) => r.json());
 };
 
+/** Progress lines from POST /train/{id}/stream (before final `complete`). */
+export type TrainStreamProgress =
+  | { phase: "prepare"; message?: string }
+  | { phase: "model"; current: number; total: number; model: string };
+
+/** Stream training with NDJSON progress; same end result as {@link trainModels}. */
+export async function trainModelsWithProgress(
+  datasetId: string,
+  targetCol: string,
+  taskType: TaskType | null,
+  hyperparams: Record<string, Record<string, number | string>>,
+  models: string[] | null,
+  splitConfig: Partial<SplitConfig>,
+  onProgress: (e: TrainStreamProgress) => void,
+): Promise<TrainResult> {
+  const p = new URLSearchParams({ target_col: targetCol });
+  if (taskType) p.append("task_type", taskType);
+  const res = await fetch(`${BASE}/train/${datasetId}/stream?${p}`, withAuth({
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ hyperparams, models, split_config: splitConfig }),
+  }));
+  if (!res.ok) {
+    const text = await res.text();
+    let msg = text || res.statusText;
+    try {
+      const j = JSON.parse(text) as { detail?: unknown };
+      if (typeof j.detail === "string") msg = j.detail;
+    } catch {
+      /* keep msg */
+    }
+    throw new Error(msg);
+  }
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("No response body");
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t) continue;
+      const obj = JSON.parse(t) as Record<string, unknown>;
+      if (obj.phase === "error") {
+        throw new Error(String(obj.detail ?? "Training failed"));
+      }
+      if (obj.phase === "complete" && obj.result != null) {
+        return obj.result as TrainResult;
+      }
+      if (obj.phase === "prepare" || obj.phase === "model") {
+        onProgress(obj as TrainStreamProgress);
+      }
+    }
+  }
+  throw new Error("Training stream ended without a result");
+}
+
 // ── Experiments ───────────────────────────────────────────────────────────────
 
 export const getExperiments = (datasetId: string): Promise<{ runs: ExperimentRun[] }> =>
   fetch(`${BASE}/experiments/${datasetId}`, withAuth()).then((r) => r.json());
 
+function runIdQuery(runId?: string | null): string {
+  const t = runId?.trim();
+  if (!t) return "";
+  return `run_id=${encodeURIComponent(t)}`;
+}
+
 // ── Importances ───────────────────────────────────────────────────────────────
 
-export const getImportances = (datasetId: string, modelName: string): Promise<ImportanceItem[]> =>
-  fetch(`${BASE}/importances/${datasetId}/${modelName}`, withAuth()).then((r) => r.json());
+export const getImportances = (
+  datasetId: string,
+  modelName: string,
+  runId?: string | null,
+): Promise<ImportanceItem[]> => {
+  const q = runIdQuery(runId);
+  const path = `${BASE}/importances/${datasetId}/${encodeURIComponent(modelName)}${q ? `?${q}` : ""}`;
+  return fetch(path, withAuth()).then(async (r) => {
+    const j = await r.json();
+    if (!r.ok) throw new Error((j as { detail?: string }).detail || "Importances failed");
+    return j as ImportanceItem[];
+  });
+};
 
 // ── Diagnostics ───────────────────────────────────────────────────────────────
 
@@ -276,6 +359,12 @@ export interface DiagnosticsPayload {
   calibration?: { mean_predicted: number[]; fraction_positives: number[] };
   regression?: Record<string, number>;
   residual_histogram?: { counts: number[]; edges: number[] };
+  predicted_vs_actual?: { actual: number[]; predicted: number[] };
+  residuals_vs_predicted?: { predicted: number[]; residuals: number[] };
+  scaler_baseline_compare?: {
+    comparisons: { scaler: string; rmse: number; r2: number }[];
+    best_scaler: string;
+  };
   learning_curve?: {
     train_sizes: number[];
     train_score_mean: number[];
@@ -285,25 +374,66 @@ export interface DiagnosticsPayload {
   permutation_importance?: { feature: string; mean: number; std: number }[];
 }
 
-export const getDiagnostics = (datasetId: string, modelName: string): Promise<DiagnosticsPayload> =>
-  fetch(`${BASE}/diagnostics/${datasetId}/${encodeURIComponent(modelName)}`, withAuth()).then(async (r) => {
+export const getDiagnostics = (
+  datasetId: string,
+  modelName: string,
+  runId?: string | null,
+): Promise<DiagnosticsPayload> => {
+  const q = runIdQuery(runId);
+  const path = `${BASE}/diagnostics/${datasetId}/${encodeURIComponent(modelName)}${q ? `?${q}` : ""}`;
+  return fetch(path, withAuth()).then(async (r) => {
     const j = await r.json();
     if (!r.ok) throw new Error((j as { detail?: string }).detail || "Diagnostics failed");
     return j as DiagnosticsPayload;
   });
+};
+
+/** Download the trained sklearn Pipeline as gzip-compressed joblib (same artifact MLflow stores). */
+export async function downloadTrainedPipeline(
+  datasetId: string,
+  modelName: string,
+  runId?: string | null,
+): Promise<void> {
+  const q = runIdQuery(runId);
+  const url = `${BASE}/export/${datasetId}/${encodeURIComponent(modelName)}/pipeline.joblib${q ? `?${q}` : ""}`;
+  const r = await fetch(url, withAuth());
+  if (!r.ok) {
+    const j = (await r.json().catch(() => ({}))) as { detail?: string };
+    throw new Error(j.detail || "Pipeline download failed");
+  }
+  const blob = await r.blob();
+  const a = document.createElement("a");
+  const cd = r.headers.get("Content-Disposition");
+  const fnMatch = cd?.match(/filename="([^"]+)"/) ?? cd?.match(/filename=([^;]+)/);
+  const safe = modelName.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_|_$/g, "") || "pipeline";
+  const fallback =
+    runId?.trim() ? `${safe}_pipeline_${runId.trim().slice(0, 8)}.joblib` : `${safe}_pipeline.joblib`;
+  a.download = (fnMatch?.[1] ?? fallback).trim();
+  a.href = URL.createObjectURL(blob);
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
 
 // ── Predict ───────────────────────────────────────────────────────────────────
 
 export const predict = (
   datasetId: string,
   modelName: string,
-  features: Record<string, number>
-): Promise<PredictionResult> =>
-  fetch(`${BASE}/predict/${datasetId}/${modelName}`, withAuth({
+  features: Record<string, number>,
+  runId?: string | null,
+): Promise<PredictionResult> => {
+  const q = runIdQuery(runId);
+  const path = `${BASE}/predict/${datasetId}/${encodeURIComponent(modelName)}${q ? `?${q}` : ""}`;
+  return fetch(path, withAuth({
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(features),
-  })).then((r) => r.json());
+  })).then(async (r) => {
+    const j = await r.json();
+    if (!r.ok) throw new Error((j as { detail?: string }).detail || "Prediction failed");
+    return j as PredictionResult;
+  });
+};
 
 // ── EDA ───────────────────────────────────────────────────────────────────────
 
@@ -429,6 +559,40 @@ export const tuneModel = (
   })).then((r) => r.json());
 };
 
+// ── Hold-out split (Split tab — before transforms) ────────────────────────────
+
+export interface HoldoutSplitConfig {
+  target_column: string;
+  test_size: number;
+  random_state: number;
+  shuffle: boolean;
+  stratify: boolean;
+}
+
+export interface HoldoutSplitStatus {
+  configured: boolean;
+  config: HoldoutSplitConfig | null;
+  column_present: boolean;
+  counts: { train: number; test: number } | null;
+}
+
+export const getHoldoutSplitStatus = (datasetId: string): Promise<HoldoutSplitStatus> =>
+  fetch(`${BASE}/datasets/${datasetId}/holdout-split`, withAuth()).then((r) => r.json());
+
+export const saveHoldoutSplit = (
+  datasetId: string,
+  body: HoldoutSplitConfig,
+): Promise<{ shape: [number, number]; columns: string[]; counts: { train: number; test: number } }> =>
+  fetch(`${BASE}/datasets/${datasetId}/holdout-split`, withAuth({
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })).then(async (r) => {
+    const j = await r.json();
+    if (!r.ok) throw new Error((j as { detail?: string }).detail || "Hold-out split failed");
+    return j as { shape: [number, number]; columns: string[]; counts: { train: number; test: number } };
+  });
+
 // ── Transforms ────────────────────────────────────────────────────────────────
 
 export const previewTransform = (
@@ -452,7 +616,11 @@ export const applyTransform = (
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ steps, from_original: fromOriginal }),
-  })).then((r) => r.json());
+  })).then(async (r) => {
+    const j = await r.json();
+    if (!r.ok) throw new Error((j as { detail?: string }).detail || "Transform apply failed");
+    return j as TransformApplyResult;
+  });
 
 export const resetTransform = (datasetId: string): Promise<{ status: string }> =>
   fetch(`${BASE}/transform/${datasetId}/reset`, withAuth({ method: "POST" })).then((r) => r.json());
@@ -480,6 +648,10 @@ export interface MLflowInfo {
   is_remote: boolean;
   /** When using local sqlite/file store: shell command to open MLflow UI against the same backend. */
   local_ui_command?: string | null;
+  /** When using uv from `backend/`: `uv run python mlflow_ui_cli.py` (same store as the API). */
+  local_ui_command_uv?: string | null;
+  /** Why plain `mlflow ui` without --backend-store-uri breaks (different store than the API). */
+  local_tracking_note?: string | null;
 }
 
 export const getMLflowInfo = (): Promise<MLflowInfo> =>

@@ -1,5 +1,7 @@
 import { ChevronDown, ChevronRight, LayoutList, Loader2, Pencil, Plus, RotateCcw, Trash2, Wand2, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { ChartExportButtons } from "../components/ChartExportButtons";
+import { DeriveTemplateQueue } from "../components/DeriveTemplateQueue";
 import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { Select } from "../components/ui/select";
@@ -15,6 +17,7 @@ import {
   getOutliers,
   getPairplot,
   getBoxplots,
+  getHoldoutSplitStatus,
   getScatter,
   getSkewness,
   getTargetAnalysis,
@@ -50,6 +53,7 @@ import {
   type FreqEncStep,
   type ImputeStep,
   type MathStep,
+  type PolynomialStep,
   type RenameStep,
   type ScaleStep,
   type Step,
@@ -58,7 +62,15 @@ import {
   makeStep,
   serializeStep,
 } from "../transformTypes";
+import {
+  buildTransformRecommendations,
+  splitRecommendationsByPhase,
+  type TransformRecommendation,
+} from "../edaTransformRecommendations";
 import { EdaTransformWarningsTab } from "../edaTransformWarnings";
+
+/** Increments when transforms are applied/reverted; sub-tabs that fetch their own data must depend on this. */
+const EdaDataRevisionContext = createContext(0);
 import { StepCard } from "./Transforms";
 import { RenameEditor } from "../components/RenameEditor";
 import { TransformTypePicker } from "../components/TransformTypePicker";
@@ -66,6 +78,7 @@ import { cn } from "../lib/utils";
 import { LoadingState } from "../components/LoadingState";
 import { PageShell } from "../components/PageShell";
 import { Badge } from "../components/ui/badge";
+import { Button } from "../components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 
@@ -73,6 +86,76 @@ interface Props {
   datasetId: string | null;
   transformSyncKey?: number;
   onTransformsMutated?: () => void;
+}
+
+/** Linear order for EDA sub-tabs (must match TabsTrigger order). */
+const EDA_TAB_ORDER = [
+  "health",
+  "recommendations",
+  "target",
+  "skewness",
+  "boxplot",
+  "pairplot",
+  "feature-target",
+  "stats",
+  "heatmap",
+  "scatter",
+  "missing",
+  "outliers",
+  "categorical",
+  "transform-warnings",
+] as const;
+
+type EdaTabId = (typeof EDA_TAB_ORDER)[number];
+
+const EDA_TAB_LABELS: Record<EdaTabId, string> = {
+  health: "Health",
+  recommendations: "Recommendations",
+  target: "Target",
+  skewness: "Skewness",
+  boxplot: "Box Plots",
+  pairplot: "Pairplot",
+  "feature-target": "Feature vs Target",
+  stats: "Stats",
+  heatmap: "Heatmap",
+  scatter: "Scatter",
+  missing: "Missing",
+  outliers: "Outliers",
+  categorical: "Categorical",
+  "transform-warnings": "Transform warnings",
+};
+
+function EdaNextTabFooter({ tabId, onNext }: { tabId: EdaTabId; onNext: () => void }) {
+  const i = EDA_TAB_ORDER.indexOf(tabId);
+  const nextId = EDA_TAB_ORDER[(i + 1) % EDA_TAB_ORDER.length];
+  const nextLabel = EDA_TAB_LABELS[nextId];
+  const wrap = i === EDA_TAB_ORDER.length - 1;
+  return (
+    <div className="mt-8 flex justify-end border-t border-slate-100 pt-6">
+      <Button type="button" variant="secondary" size="sm" className="gap-1.5" onClick={onNext}>
+        {wrap ? "Start over · " : "Next · "}
+        {nextLabel}
+        <ChevronRight className="h-4 w-4" />
+      </Button>
+    </div>
+  );
+}
+
+function EdaTabWithNext({
+  tabId,
+  onNext,
+  children,
+}: {
+  tabId: EdaTabId;
+  onNext: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <>
+      {children}
+      <EdaNextTabFooter tabId={tabId} onNext={onNext} />
+    </>
+  );
 }
 
 /** Sub-tabs to compare original upload vs transformed data when a pipeline is active. */
@@ -274,44 +357,172 @@ function StatsTab({
 }
 
 // ── Heatmap tab ───────────────────────────────────────────────────────────────
-function HeatmapInner({ datasetId, source }: { datasetId: string; source: EdaDataSource }) {
+function topCorrelatedFeaturesForTarget(
+  columns: string[],
+  matrix: number[][],
+  target: string,
+  k: number,
+): string[] {
+  const ti = columns.indexOf(target);
+  if (ti < 0 || k <= 0) return [];
+  const row = matrix[ti];
+  if (!row || row.length !== columns.length) return [];
+  return columns
+    .map((c, i) => ({ c, score: i === ti ? -1 : Math.abs(row[i] ?? 0) }))
+    .filter((x) => x.c !== target)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, k)
+    .map((x) => x.c);
+}
+
+function HeatmapInner({
+  datasetId,
+  source,
+  onQueuePolynomialSteps,
+}: {
+  datasetId: string;
+  source: EdaDataSource;
+  onQueuePolynomialSteps?: (steps: Step[]) => void;
+}) {
+  const edaDataRevision = useContext(EdaDataRevisionContext);
   const [data, setData] = useState<CorrelationMatrix | null>(null);
-  useEffect(() => { getCorrelationMatrix(datasetId, source).then(setData); }, [datasetId, source]);
+  const [targetCol, setTargetCol] = useState("");
+  const [topK, setTopK] = useState(5);
+  const [polyDegree, setPolyDegree] = useState(2);
+  const defaultedTarget = useRef(false);
+
+  useEffect(() => {
+    getCorrelationMatrix(datasetId, source).then(setData);
+  }, [datasetId, source, edaDataRevision]);
+
+  useEffect(() => {
+    defaultedTarget.current = false;
+    setTargetCol("");
+  }, [datasetId, source, edaDataRevision]);
+
+  useEffect(() => {
+    if (data?.columns?.length && !defaultedTarget.current) {
+      defaultedTarget.current = true;
+      setTargetCol(data.columns[data.columns.length - 1] ?? "");
+    }
+  }, [data]);
+
+  const queuePolynomialFromHeatmap = () => {
+    if (!onQueuePolynomialSteps || !data?.columns.length || !targetCol) return;
+    const feats = topCorrelatedFeaturesForTarget(data.columns, data.matrix, targetCol, topK);
+    if (!feats.length) {
+      toast.error("Choose a target column that is in the correlation matrix.");
+      return;
+    }
+    const step = makeStep("polynomial_features") as PolynomialStep;
+    step.columns = feats;
+    step.degree = Math.min(4, Math.max(2, polyDegree));
+    step.interaction_only = false;
+    step.include_bias = false;
+    onQueuePolynomialSteps([step]);
+    toast.success(`Queued polynomial features (degree ${step.degree}) on ${feats.length} columns`);
+  };
+
   if (!data) return <LoadingState message="Loading correlation matrix…" className="min-h-[220px]" />;
 
   const n = data.columns.length;
   const cellSize = Math.min(52, Math.floor(680 / n));
+  const maxLabelLen = Math.max(1, ...data.columns.map((c) => c.length));
+  /** Enough room for full row names (one-hot columns can be long). */
+  const labelColWidth = Math.min(288, Math.max(112, Math.ceil(maxLabelLen * 6.2) + 20));
 
   return (
     <Card>
-      <CardHeader><CardTitle>Correlation Heatmap</CardTitle></CardHeader>
-      <CardContent className="overflow-auto">
-        <div style={{ display: "grid", gridTemplateColumns: `80px repeat(${n}, ${cellSize}px)`, gap: 1 }}>
+      <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <CardTitle>Correlation heatmap</CardTitle>
+        {onQueuePolynomialSteps && (
+          <div className="flex flex-col gap-2 rounded-lg border border-slate-200 bg-slate-50/80 p-3 text-xs w-full sm:max-w-md">
+            <p className="font-medium text-slate-700">Queue polynomial from top |r| vs target</p>
+            <div className="flex flex-wrap items-end gap-2">
+              <div className="min-w-[140px] flex-1">
+                <label className="mb-0.5 block text-[11px] text-slate-500">Target column</label>
+                <Select
+                  size="sm"
+                  value={targetCol}
+                  onChange={setTargetCol}
+                  options={data.columns.map((c) => ({ value: c, label: c }))}
+                />
+              </div>
+              <div className="w-20">
+                <label className="mb-0.5 block text-[11px] text-slate-500">Top K</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={topK}
+                  onChange={(e) => setTopK(Math.min(20, Math.max(1, parseInt(e.target.value, 10) || 1)))}
+                  className="w-full rounded-md border border-slate-200 px-2 py-1.5 text-xs"
+                />
+              </div>
+              <div className="w-20">
+                <label className="mb-0.5 block text-[11px] text-slate-500">Degree</label>
+                <input
+                  type="number"
+                  min={2}
+                  max={4}
+                  value={polyDegree}
+                  onChange={(e) => setPolyDegree(Math.min(4, Math.max(2, parseInt(e.target.value, 10) || 2)))}
+                  className="w-full rounded-md border border-slate-200 px-2 py-1.5 text-xs"
+                />
+              </div>
+              <Button type="button" size="sm" variant="secondary" className="shrink-0" onClick={queuePolynomialFromHeatmap}>
+                Queue step
+              </Button>
+            </div>
+            <p className="text-[11px] text-slate-500">
+              Opens the quick transform queue with <code className="rounded bg-white px-1">polynomial_features</code> on the K features most correlated with the target (by absolute Pearson r).
+            </p>
+          </div>
+        )}
+      </CardHeader>
+      <CardContent className="overflow-x-auto overflow-y-visible">
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: `${labelColWidth}px repeat(${n}, ${cellSize}px)`,
+            gap: 1,
+            alignItems: "stretch",
+          }}
+        >
           {/* Top-left empty */}
           <div />
-          {/* Column headers */}
+          {/* Column headers: wrap inside narrow cells instead of truncating */}
           {data.columns.map((c) => (
-            <div key={c} className="text-[10px] text-slate-500 font-medium text-center truncate px-0.5" style={{ width: cellSize }}>
+            <div
+              key={c}
+              title={c}
+              className="text-[9px] font-medium leading-tight text-slate-600 text-center [overflow-wrap:anywhere] break-words px-0.5 pb-1 flex flex-col justify-end min-h-[4.5rem]"
+              style={{ width: cellSize, minWidth: cellSize }}
+            >
               {c}
             </div>
           ))}
           {/* Rows */}
           {data.columns.map((row, ri) => (
-            <>
-              <div key={`lbl-${row}`} className="text-[10px] text-slate-500 font-medium text-right pr-2 flex items-center justify-end truncate">
+            <div key={row} style={{ display: "contents" }}>
+              <div
+                title={row}
+                className="sticky left-0 z-[1] text-[10px] font-medium text-slate-600 text-right pr-2 py-1 [overflow-wrap:anywhere] break-words flex items-center justify-end border-r border-slate-200 bg-white shadow-[2px_0_6px_-2px_rgba(15,23,42,0.08)]"
+                style={{ minWidth: labelColWidth, maxWidth: labelColWidth }}
+              >
                 {row}
               </div>
               {data.matrix[ri].map((val, ci) => (
                 <div
                   key={`${ri}-${ci}`}
                   title={`${row} × ${data.columns[ci]}: ${val.toFixed(3)}`}
-                  className="flex items-center justify-center rounded"
+                  className="flex items-center justify-center rounded shrink-0"
                   style={{ width: cellSize, height: cellSize, background: corrColor(val), fontSize: cellSize > 36 ? 9 : 0 }}
                 >
                   {cellSize > 36 ? val.toFixed(2) : ""}
                 </div>
               ))}
-            </>
+            </div>
           ))}
         </div>
         <div className="flex items-center gap-2 mt-4 text-xs text-slate-500">
@@ -324,10 +535,24 @@ function HeatmapInner({ datasetId, source }: { datasetId: string; source: EdaDat
   );
 }
 
-function HeatmapTab({ datasetId, transformActive }: { datasetId: string; transformActive: boolean }) {
+function HeatmapTab({
+  datasetId,
+  transformActive,
+  onQueuePolynomialSteps,
+}: {
+  datasetId: string;
+  transformActive: boolean;
+  onQueuePolynomialSteps?: (steps: Step[]) => void;
+}) {
   return (
     <EdaBeforeAfterTabs transformActive={transformActive}>
-      {(source) => <HeatmapInner datasetId={datasetId} source={source} />}
+      {(source) => (
+        <HeatmapInner
+          datasetId={datasetId}
+          source={source}
+          onQueuePolynomialSteps={onQueuePolynomialSteps}
+        />
+      )}
     </EdaBeforeAfterTabs>
   );
 }
@@ -342,11 +567,13 @@ function ScatterInner({
   columns: string[];
   source: EdaDataSource;
 }) {
+  const edaDataRevision = useContext(EdaDataRevisionContext);
   const [colX, setColX] = useState(columns[0] ?? "");
   const [colY, setColY] = useState(columns[1] ?? columns[0] ?? "");
   const [target, setTarget] = useState("");
   const [data, setData] = useState<ScatterData | null>(null);
   const [loading, setLoading] = useState(false);
+  const scatterExportRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setColX((x) => (columns.includes(x) ? x : columns[0] ?? ""));
@@ -356,7 +583,7 @@ function ScatterInner({
 
   useEffect(() => {
     setData(null);
-  }, [source]);
+  }, [source, edaDataRevision]);
 
   const fetchScatter = () => {
     if (!colX || !colY) return;
@@ -397,7 +624,15 @@ function ScatterInner({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Scatter Plot</CardTitle>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <CardTitle>Scatter Plot</CardTitle>
+          <ChartExportButtons
+            targetRef={scatterExportRef}
+            filenameBase={`eda_scatter_${colX}_${colY}`}
+            disabled={!data || loading}
+            className="shrink-0"
+          />
+        </div>
         <div className="flex gap-2 mt-2 flex-wrap">
           {([["X axis", colX, setColX], ["Y axis", colY, setColY]] as [string, string, (v: string) => void][]).map(([label, val, setter]) => (
             <div key={label}>
@@ -436,6 +671,7 @@ function ScatterInner({
       <CardContent className="relative min-h-[200px]">
         {loading && <LoadingState variant="overlay" message="Loading scatter plot…" className="rounded-lg" />}
         {data && !loading && (
+          <div ref={scatterExportRef} className="rounded-md bg-white p-2">
           <svg width={W} height={H} className="w-full">
             {/* Axes */}
             <line x1={PAD} y1={H - PAD} x2={W - PAD} y2={H - PAD} stroke="#e2e8f0" strokeWidth={1} />
@@ -447,6 +683,7 @@ function ScatterInner({
               <circle key={i} cx={sx(x)} cy={sy(ys[i])} r={3} fill={dotColor(i)} fillOpacity={0.7} />
             ))}
           </svg>
+          </div>
         )}
         {!data && !loading && (
           <p className="text-sm text-slate-500 py-8 text-center">Select axes and click Plot</p>
@@ -479,8 +716,9 @@ function ScatterTab({
 
 // ── Missing tab ───────────────────────────────────────────────────────────────
 function MissingInner({ datasetId, source }: { datasetId: string; source: EdaDataSource }) {
+  const edaDataRevision = useContext(EdaDataRevisionContext);
   const [data, setData] = useState<MissingValues | null>(null);
-  useEffect(() => { getMissingValues(datasetId, source).then(setData); }, [datasetId, source]);
+  useEffect(() => { getMissingValues(datasetId, source).then(setData); }, [datasetId, source, edaDataRevision]);
   if (!data) return <LoadingState message="Loading missing-value stats…" className="min-h-[200px]" />;
 
   const cols = Object.entries(data).sort(([, a], [, b]) => b.pct - a.pct);
@@ -525,8 +763,9 @@ function MissingTab({ datasetId, transformActive }: { datasetId: string; transfo
 
 // ── Outliers tab ──────────────────────────────────────────────────────────────
 function OutliersInner({ datasetId, source }: { datasetId: string; source: EdaDataSource }) {
+  const edaDataRevision = useContext(EdaDataRevisionContext);
   const [data, setData] = useState<OutlierInfo | null>(null);
-  useEffect(() => { getOutliers(datasetId, source).then(setData); }, [datasetId, source]);
+  useEffect(() => { getOutliers(datasetId, source).then(setData); }, [datasetId, source, edaDataRevision]);
   if (!data) return <LoadingState message="Loading outlier summary…" className="min-h-[200px]" />;
 
   const cols = Object.entries(data).sort(([, a], [, b]) => b.n_outliers - a.n_outliers);
@@ -575,8 +814,9 @@ function OutliersTab({ datasetId, transformActive }: { datasetId: string; transf
 
 // ── Categorical tab ───────────────────────────────────────────────────────────
 function CategoricalInner({ datasetId, source }: { datasetId: string; source: EdaDataSource }) {
+  const edaDataRevision = useContext(EdaDataRevisionContext);
   const [data, setData] = useState<CategoricalStats | null>(null);
-  useEffect(() => { getCategorical(datasetId, source).then(setData); }, [datasetId, source]);
+  useEffect(() => { getCategorical(datasetId, source).then(setData); }, [datasetId, source, edaDataRevision]);
   if (!data) return <LoadingState message="Loading categorical stats…" className="min-h-[200px]" />;
 
   const cols = Object.entries(data);
@@ -622,8 +862,9 @@ function CategoricalTab({ datasetId, transformActive }: { datasetId: string; tra
 
 // ── Health tab ────────────────────────────────────────────────────────────────
 function HealthInner({ datasetId, source }: { datasetId: string; source: EdaDataSource }) {
+  const edaDataRevision = useContext(EdaDataRevisionContext);
   const [data, setData] = useState<HealthResult | null>(null);
-  useEffect(() => { getHealth(datasetId, source).then(setData); }, [datasetId, source]);
+  useEffect(() => { getHealth(datasetId, source).then(setData); }, [datasetId, source, edaDataRevision]);
   if (!data) return <LoadingState message="Loading health metrics…" className="min-h-[240px]" />;
 
   const completenessEntries = Object.entries(data.completeness).sort(([,a],[,b]) => a - b);
@@ -712,6 +953,374 @@ function HealthTab({ datasetId, transformActive }: { datasetId: string; transfor
   );
 }
 
+// ── Transform recommendations (from EDA signals) ─────────────────────────────
+function RecommendationsInner({
+  datasetId,
+  source,
+  transformSyncKey,
+  onApplied,
+  columnOptions,
+}: {
+  datasetId: string;
+  source: EdaDataSource;
+  transformSyncKey: number;
+  onApplied: () => void;
+  columnOptions: string[];
+}) {
+  const [missing, setMissing] = useState<MissingValues | null>(null);
+  const [outliers, setOutliers] = useState<OutlierInfo | null>(null);
+  const [skewness, setSkewness] = useState<SkewnessRow[] | null>(null);
+  const [health, setHealth] = useState<HealthResult | null>(null);
+  const [targetCol, setTargetCol] = useState("");
+  const [targetAnalysis, setTargetAnalysis] = useState<TargetAnalysis | null>(null);
+  const [loadingTa, setLoadingTa] = useState(false);
+  const [applyingId, setApplyingId] = useState<string | null>(null);
+  const [applyingBatch, setApplyingBatch] = useState<null | "pre" | "post" | "full">(null);
+
+  useEffect(() => {
+    setMissing(null);
+    setOutliers(null);
+    setSkewness(null);
+    setHealth(null);
+    Promise.all([
+      getMissingValues(datasetId, source),
+      getOutliers(datasetId, source),
+      getSkewness(datasetId, source),
+      getHealth(datasetId, source),
+    ])
+      .then(([m, o, s, h]) => {
+        setMissing(m);
+        setOutliers(o);
+        setSkewness(s);
+        setHealth(h);
+      })
+      .catch(() => {
+        toast.error("Could not load EDA stats for recommendations.");
+      });
+  }, [datasetId, source, transformSyncKey]);
+
+  useEffect(() => {
+    if (!targetCol) {
+      setTargetAnalysis(null);
+      return;
+    }
+    setLoadingTa(true);
+    getTargetAnalysis(datasetId, targetCol, source)
+      .then(setTargetAnalysis)
+      .catch(() => setTargetAnalysis(null))
+      .finally(() => setLoadingTa(false));
+  }, [datasetId, source, targetCol, transformSyncKey]);
+
+  const recommendations = useMemo(() => {
+    if (!missing || !outliers || !skewness || !health) return [];
+    return buildTransformRecommendations({
+      missing,
+      outliers,
+      skewness,
+      health,
+      targetAnalysis: targetCol ? targetAnalysis : null,
+    });
+  }, [missing, outliers, skewness, health, targetCol, targetAnalysis]);
+
+  const { pre: preSplitRecs, post: postSplitRecs } = useMemo(
+    () => splitRecommendationsByPhase(recommendations),
+    [recommendations],
+  );
+
+  const busy = applyingId !== null || applyingBatch !== null;
+
+  const handleApplyOne = async (rec: TransformRecommendation) => {
+    try {
+      const st = await getHoldoutSplitStatus(datasetId);
+      if (!st.column_present) {
+        toast.error("Save your hold-out on the Split tab before applying transform steps.");
+        return;
+      }
+      setApplyingId(rec.id);
+      await applyTransform(datasetId, [serializeStep(rec.step)], false);
+      toast.success(`Applied: ${rec.title}`);
+      onApplied();
+    } catch (e) {
+      toast.error((e as Error).message || "Apply failed");
+    } finally {
+      setApplyingId(null);
+    }
+  };
+
+  const handleApplyPreSplit = async () => {
+    if (preSplitRecs.length === 0) return;
+    const st = await getHoldoutSplitStatus(datasetId);
+    if (!st.column_present) {
+      toast.error("Save your hold-out on the Split tab first (then you can apply these steps).");
+      return;
+    }
+    try {
+      setApplyingBatch("pre");
+      await applyTransform(
+        datasetId,
+        preSplitRecs.map((r) => serializeStep(r.step)),
+        false,
+      );
+      toast.success(`Applied ${preSplitRecs.length} pre-split step(s).`);
+      onApplied();
+    } catch (e) {
+      toast.error((e as Error).message || "Apply failed");
+    } finally {
+      setApplyingBatch(null);
+    }
+  };
+
+  const handleApplyPostSplit = async () => {
+    if (postSplitRecs.length === 0) return;
+    try {
+      setApplyingBatch("post");
+      await applyTransform(
+        datasetId,
+        postSplitRecs.map((r) => serializeStep(r.step)),
+        false,
+      );
+      toast.success(`Applied ${postSplitRecs.length} post-split step(s).`);
+      onApplied();
+    } catch (e) {
+      toast.error((e as Error).message || "Apply failed");
+    } finally {
+      setApplyingBatch(null);
+    }
+  };
+
+  const handleApplyFullSequence = async () => {
+    if (recommendations.length === 0) return;
+    const st = await getHoldoutSplitStatus(datasetId);
+    if (!st.column_present) {
+      toast.error("Save your hold-out on the Split tab before applying the full recommendation sequence.");
+      return;
+    }
+    const preSteps = preSplitRecs.map((r) => serializeStep(r.step));
+    const postSteps = postSplitRecs.map((r) => serializeStep(r.step));
+    const steps = [...preSteps, ...postSteps];
+    if (steps.length === 0) return;
+    try {
+      setApplyingBatch("full");
+      await applyTransform(datasetId, steps, false);
+      toast.success(
+        postSteps.length > 0
+          ? `Applied ${steps.length} steps (pre-split + post-split).`
+          : `Applied ${steps.length} step(s).`,
+      );
+      onApplied();
+    } catch (e) {
+      toast.error((e as Error).message || "Apply failed");
+    } finally {
+      setApplyingBatch(null);
+    }
+  };
+
+  if (!missing || !outliers || !skewness || !health) {
+    return <LoadingState message="Loading recommendation signals…" className="min-h-[240px]" />;
+  }
+
+  const phaseBadge = (phase: TransformRecommendation["phase"]) =>
+    phase === "pre_split" ? (
+      <Badge variant="secondary" className="text-[10px] font-semibold uppercase tracking-wide">
+        Before split
+      </Badge>
+    ) : (
+      <Badge className="border border-violet-300 bg-violet-50 text-[10px] font-semibold uppercase tracking-wide text-violet-800">
+        After split
+      </Badge>
+    );
+
+  return (
+    <div className="space-y-5">
+      <Card className="border-slate-200 bg-slate-50/50">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base">How pre-split vs post-split works here</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-2 text-xs text-slate-600 leading-relaxed">
+          <p>
+            <strong className="text-slate-800">Before split</strong> steps (drop duplicates, drop constants) can be applied before or after you use the{" "}
+            <strong className="text-slate-800">Split</strong> tab — they do not need <code className="rounded bg-white px-1 text-[10px]">__ml_split__</code>.
+          </p>
+          <p>
+            <strong className="text-slate-800">After split</strong> steps (impute, clip, skew, frequency encode) should run only once{" "}
+            <code className="rounded bg-white px-1 text-[10px]">__ml_split__</code> exists (save hold-out on the Split tab first). They still run as pandas on the whole CSV — for train-only statistics, use the Train tab&apos;s sklearn pipeline.
+          </p>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Modeling target</CardTitle>
+          <p className="text-xs text-slate-500 mt-1">
+            Used for skew-aware &quot;Fix skewness&quot; suggestions. Hold-out assignment is configured on the <strong>Split</strong> tab. For &quot;Apply full sequence&quot; with post-split recs, save split there first.
+          </p>
+        </CardHeader>
+        <CardContent className="flex flex-wrap items-end gap-3">
+          <div className="min-w-[200px] flex-1">
+            <label className="mb-1 block text-xs font-medium text-slate-600">Target column</label>
+            <Select
+              value={targetCol}
+              onChange={setTargetCol}
+              options={[
+                { value: "", label: "None" },
+                ...columnOptions.map((c) => ({ value: c, label: c })),
+              ]}
+            />
+          </div>
+          {loadingTa && targetCol ? <Loader2 className="h-4 w-4 shrink-0 animate-spin text-slate-400" /> : null}
+        </CardContent>
+      </Card>
+
+      <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+        <p className="text-sm text-slate-600 max-w-2xl">
+          {recommendations.length === 0
+            ? "No automatic recommendations for this view."
+            : `${recommendations.length} suggestion(s): ${preSplitRecs.length} before split, ${postSplitRecs.length} after.`}
+        </p>
+        {recommendations.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {preSplitRecs.length > 0 && (
+              <Button type="button" variant="outline" size="sm" onClick={() => void handleApplyPreSplit()} disabled={busy}>
+                {applyingBatch === "pre" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Apply pre-split ({preSplitRecs.length})
+              </Button>
+            )}
+            {postSplitRecs.length > 0 && (
+              <Button type="button" variant="outline" size="sm" onClick={() => void handleApplyPostSplit()} disabled={busy}>
+                {applyingBatch === "post" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Apply post-split ({postSplitRecs.length})
+              </Button>
+            )}
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => void handleApplyFullSequence()}
+              disabled={busy || (postSplitRecs.length > 0 && !targetCol)}
+              title={
+                postSplitRecs.length > 0 && !targetCol
+                  ? "Select a target column to insert Train/Test Split before post-split steps"
+                  : undefined
+              }
+            >
+              {applyingBatch === "full" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              Apply full sequence
+            </Button>
+          </div>
+        )}
+      </div>
+      {recommendations.length > 0 && postSplitRecs.length > 0 && !targetCol && (
+        <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+          Select a <strong>target column</strong> to use &quot;Apply full sequence&quot; (inserts Train/Test Split between the two groups). You can still apply pre- or post-split groups separately.
+        </p>
+      )}
+
+      {preSplitRecs.length > 0 && (
+        <div className="space-y-3">
+          <h3 className="text-sm font-semibold text-slate-800">Before train/test split</h3>
+          {preSplitRecs.map((rec) => (
+            <Card key={rec.id}>
+              <CardContent className="flex flex-col gap-3 pt-5 sm:flex-row sm:items-start sm:justify-between">
+                <div className="min-w-0 space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {phaseBadge(rec.phase)}
+                    <p className="font-semibold text-slate-900">{rec.title}</p>
+                  </div>
+                  <p className="text-xs text-slate-600 leading-relaxed">{rec.description}</p>
+                  <p className="text-[11px] text-slate-500 font-mono break-all">
+                    {STEP_META[rec.step.type]?.label}: {stepSummary(rec.step as unknown as Record<string, unknown>)}
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  className="shrink-0"
+                  disabled={busy}
+                  onClick={() => void handleApplyOne(rec)}
+                >
+                  {applyingId === rec.id ? <Loader2 className="h-4 w-4 animate-spin" /> : "Apply this"}
+                </Button>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {preSplitRecs.length > 0 && postSplitRecs.length > 0 && (
+        <div className="rounded-lg border border-dashed border-blue-300 bg-blue-50/90 px-4 py-3 text-center">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-blue-900">Train / test split step</p>
+          <p className="text-xs text-blue-800/90 mt-1">
+            &quot;Apply full sequence&quot; inserts the default <strong>Train/Test Split</strong> (20% hold-out, stratified when possible) after the block above and before the block below. Add or edit that step on the Transforms tab if needed.
+          </p>
+        </div>
+      )}
+
+      {postSplitRecs.length > 0 && (
+        <div className="space-y-3">
+          <h3 className="text-sm font-semibold text-slate-800">After train/test split</h3>
+          {postSplitRecs.map((rec) => (
+            <Card key={rec.id}>
+              <CardContent className="flex flex-col gap-3 pt-5 sm:flex-row sm:items-start sm:justify-between">
+                <div className="min-w-0 space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {phaseBadge(rec.phase)}
+                    <p className="font-semibold text-slate-900">{rec.title}</p>
+                  </div>
+                  <p className="text-xs text-slate-600 leading-relaxed">{rec.description}</p>
+                  <p className="text-[11px] text-slate-500 font-mono break-all">
+                    {STEP_META[rec.step.type]?.label}: {stepSummary(rec.step as unknown as Record<string, unknown>)}
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  className="shrink-0"
+                  disabled={busy}
+                  onClick={() => void handleApplyOne(rec)}
+                >
+                  {applyingId === rec.id ? <Loader2 className="h-4 w-4 animate-spin" /> : "Apply this"}
+                </Button>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RecommendationsTab({
+  datasetId,
+  transformActive,
+  transformSyncKey,
+  onTransformsMutated,
+  columns,
+  columnsOriginal,
+}: {
+  datasetId: string;
+  transformActive: boolean;
+  transformSyncKey: number;
+  onTransformsMutated?: () => void;
+  columns: string[];
+  columnsOriginal: string[];
+}) {
+  return (
+    <EdaBeforeAfterTabs transformActive={transformActive}>
+      {(source) => {
+        const cols = source === "original" && columnsOriginal.length > 0 ? columnsOriginal : columns;
+        return (
+          <RecommendationsInner
+            datasetId={datasetId}
+            source={source}
+            transformSyncKey={transformSyncKey}
+            onApplied={() => onTransformsMutated?.()}
+            columnOptions={cols}
+          />
+        );
+      }}
+    </EdaBeforeAfterTabs>
+  );
+}
+
 // ── Target tab ────────────────────────────────────────────────────────────────
 function TargetInner({
   datasetId,
@@ -722,6 +1331,7 @@ function TargetInner({
   columns: string[];
   source: EdaDataSource;
 }) {
+  const edaDataRevision = useContext(EdaDataRevisionContext);
   const [sel, setSel] = useState(columns[0] ?? "");
   const [data, setData] = useState<TargetAnalysis | null>(null);
   const [loading, setLoading] = useState(false);
@@ -735,7 +1345,7 @@ function TargetInner({
     setLoading(true);
     setData(null);
     getTargetAnalysis(datasetId, sel, source).then(setData).finally(() => setLoading(false));
-  }, [sel, datasetId, source]);
+  }, [sel, datasetId, source, edaDataRevision]);
 
   return (
     <div className="space-y-5">
@@ -856,8 +1466,9 @@ function TargetTab({
 
 // ── Skewness tab ──────────────────────────────────────────────────────────────
 function SkewnessInner({ datasetId, source }: { datasetId: string; source: EdaDataSource }) {
+  const edaDataRevision = useContext(EdaDataRevisionContext);
   const [data, setData] = useState<SkewnessRow[] | null>(null);
-  useEffect(() => { getSkewness(datasetId, source).then(setData); }, [datasetId, source]);
+  useEffect(() => { getSkewness(datasetId, source).then(setData); }, [datasetId, source, edaDataRevision]);
   if (!data) return <LoadingState message="Loading skewness & kurtosis…" className="min-h-[200px]" />;
 
   const severityColor = { normal: "text-emerald-600", moderate: "text-amber-600", high: "text-rose-600" };
@@ -925,6 +1536,7 @@ function BoxplotInner({
   columns: string[];
   source: EdaDataSource;
 }) {
+  const edaDataRevision = useContext(EdaDataRevisionContext);
   const [data, setData] = useState<BoxplotData | null>(null);
   const [sel, setSel] = useState<string[]>(columns.slice(0, 6));
   const [loading, setLoading] = useState(false);
@@ -940,7 +1552,7 @@ function BoxplotInner({
   useEffect(() => {
     setLoading(true);
     getBoxplots(datasetId, sel.length ? sel : undefined, source).then(setData).finally(() => setLoading(false));
-  }, [datasetId, sel.join(","), source]);
+  }, [datasetId, sel.join(","), source, edaDataRevision]);
 
   const PALETTE = ["#3b82f6","#10b981","#f59e0b","#ef4444","#8b5cf6","#06b6d4"];
   const H = 180;
@@ -1037,6 +1649,7 @@ function PairplotInner({
   columns: string[];
   source: EdaDataSource;
 }) {
+  const edaDataRevision = useContext(EdaDataRevisionContext);
   const [sel, setSel] = useState<string[]>(columns.slice(0, 4));
   const [data, setData] = useState<PairplotData | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1054,7 +1667,7 @@ function PairplotInner({
     setLoading(true);
     setData(null);
     getPairplot(datasetId, sel, source).then(setData).finally(() => setLoading(false));
-  }, [datasetId, sel.join(","), source]);
+  }, [datasetId, sel.join(","), source, edaDataRevision]);
 
   const CELL = 100;
 
@@ -1158,6 +1771,7 @@ function FeatureTargetInner({
   columns: string[];
   source: EdaDataSource;
 }) {
+  const edaDataRevision = useContext(EdaDataRevisionContext);
   const [target, setTarget] = useState(columns[columns.length - 1] ?? "");
   const [data, setData]     = useState<FeatureTargetData | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1171,7 +1785,7 @@ function FeatureTargetInner({
     setLoading(true);
     setData(null);
     getFeatureTarget(datasetId, target, source).then(setData).finally(() => setLoading(false));
-  }, [datasetId, target, source]);
+  }, [datasetId, target, source, edaDataRevision]);
 
   const W = 280, H = 160, PAD = 28;
 
@@ -1416,6 +2030,11 @@ function QuickTransformPanel({
 
   const handleApply = async () => {
     if (!steps.length) { toast.error("Add at least one step."); return; }
+    const st = await getHoldoutSplitStatus(datasetId);
+    if (!st.column_present) {
+      toast.error("Save your hold-out on the Split tab before applying quick transforms.");
+      return;
+    }
     try {
       setApplying(true);
       const fromOriginal = pipelineReplaceMode;
@@ -1462,7 +2081,7 @@ function QuickTransformPanel({
       </button>
 
       {open && (
-        <div className="relative space-y-4 rounded-b-2xl border-t border-blue-200/80 bg-white/80 px-4 pb-4 pt-4 backdrop-blur-[2px]">
+        <div className="relative space-y-5 rounded-b-2xl border-t border-blue-200/80 bg-white/80 px-4 pb-4 pt-4 backdrop-blur-[2px]">
           {pipelineReplaceMode && (
             <div className="rounded-xl border border-violet-200 bg-violet-50 px-3 py-2.5 text-[11px] leading-snug text-violet-900">
               <p className="font-semibold text-violet-950">Replacing the full pipeline</p>
@@ -1471,32 +2090,38 @@ function QuickTransformPanel({
               </p>
             </div>
           )}
-          <div>
-            <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">Add a step</label>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
-              <TransformTypePicker value={addType} onChange={setAddType} size="sm" className="min-w-0 flex-1" />
-              <button
-                type="button"
-                onClick={addStep}
-                className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-blue-700"
-              >
+          <DeriveTemplateQueue
+            allColumns={allColumns}
+            disabled={applying}
+            onQueueSteps={(newSteps) => setSteps((p) => [...p, ...newSteps])}
+          />
+
+          <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm ring-1 ring-slate-100/80">
+            <h3 className="text-sm font-semibold text-slate-800">Add a transform step</h3>
+            <p className="mt-1 text-xs leading-relaxed text-slate-600">{STEP_META[addType].description}</p>
+            <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-end">
+              <div className="min-w-0 flex-1">
+                <label className="mb-1.5 block text-[11px] font-medium text-slate-600">Transform type</label>
+                <TransformTypePicker value={addType} onChange={setAddType} size="sm" className="w-full" />
+              </div>
+              <Button type="button" onClick={addStep} className="h-10 shrink-0 gap-1.5 sm:min-w-[10.5rem]">
                 <Plus className="h-4 w-4" />
                 Add to queue
-              </button>
+              </Button>
             </div>
-            <p className="mt-2 rounded-lg bg-slate-50 px-3 py-2 text-xs leading-relaxed text-slate-600">{STEP_META[addType].description}</p>
-          </div>
+          </section>
 
-          {steps.length === 0 && (
-            <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50/60 px-4 py-8 text-center">
-              <p className="text-sm font-medium text-slate-600">Nothing in the queue yet</p>
-              <p className="mt-1 text-xs text-slate-400">
-                Pick a transform type, then tap <span className="font-medium text-slate-500">Add to queue</span>.
-              </p>
-            </div>
-          )}
-
-          <div className="space-y-3">
+          <div>
+            <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Queue</h3>
+            {steps.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50/50 px-4 py-10 text-center">
+                <p className="text-sm font-medium text-slate-600">Nothing queued yet</p>
+                <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-slate-500">
+                  Use <span className="font-medium text-slate-600">Derived columns</span> or <span className="font-medium text-slate-600">Add a transform step</span> above, then apply when ready.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-3">
             {steps.map((step, idx) => (
               <div key={step.id} className="rounded-xl border border-slate-200/90 bg-white shadow-sm ring-1 ring-slate-100">
                 <div className="flex items-start gap-3 border-b border-slate-100 bg-gradient-to-r from-slate-50/90 to-white px-3 py-2.5">
@@ -1552,20 +2177,56 @@ function QuickTransformPanel({
                         </div>
                       )}
                       {step.type === "clip_outliers" && (
-                        <div>
+                        <div className="space-y-2">
                           <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">Detection method</label>
-                          <div className="flex gap-1.5">
-                            {(["iqr", "zscore"] as ClipStep["method"][]).map((m) => (
+                          <div className="flex flex-wrap gap-1.5">
+                            {(["iqr", "zscore", "percentile"] as ClipStep["method"][]).map((m) => (
                               <button
                                 key={m}
                                 type="button"
                                 onClick={() => updateStep(step.id, { method: m } as Partial<Step>)}
-                                className={edaOptChip((step as ClipStep).method === m, "flex-1 py-2")}
+                                className={edaOptChip((step as ClipStep).method === m, "flex-1 min-w-[72px] py-2")}
                               >
-                                {m === "iqr" ? "IQR" : "Z-score"}
+                                {m === "iqr" ? "IQR" : m === "zscore" ? "Z-score" : "Percentile"}
                               </button>
                             ))}
                           </div>
+                          {(step as ClipStep).method === "percentile" && (
+                            <div className="flex gap-2">
+                              <div className="flex-1">
+                                <label className="mb-0.5 block text-[10px] text-slate-500">Low q</label>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  max={0.5}
+                                  step={0.01}
+                                  value={(step as ClipStep).p_low ?? 0.01}
+                                  onChange={(e) =>
+                                    updateStep(step.id, {
+                                      p_low: Math.min(0.49, Math.max(0, parseFloat(e.target.value) || 0)),
+                                    } as Partial<Step>)
+                                  }
+                                  className="w-full rounded-md border border-slate-200 px-2 py-1 text-xs"
+                                />
+                              </div>
+                              <div className="flex-1">
+                                <label className="mb-0.5 block text-[10px] text-slate-500">High q</label>
+                                <input
+                                  type="number"
+                                  min={0.5}
+                                  max={1}
+                                  step={0.01}
+                                  value={(step as ClipStep).p_high ?? 0.99}
+                                  onChange={(e) =>
+                                    updateStep(step.id, {
+                                      p_high: Math.min(1, Math.max(0.51, parseFloat(e.target.value) || 1)),
+                                    } as Partial<Step>)
+                                  }
+                                  className="w-full rounded-md border border-slate-200 px-2 py-1 text-xs"
+                                />
+                              </div>
+                            </div>
+                          )}
                         </div>
                       )}
                       {step.type === "scale" && (
@@ -1586,7 +2247,7 @@ function QuickTransformPanel({
                         </div>
                       )}
                       {step.type === "math_transform" && (
-                        <div>
+                        <div className="space-y-2">
                           <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">Function</label>
                           <div className="flex flex-wrap gap-1.5">
                             {(["log1p", "sqrt", "square", "reciprocal", "abs"] as MathStep["method"][]).map((m) => (
@@ -1600,7 +2261,27 @@ function QuickTransformPanel({
                               </button>
                             ))}
                           </div>
-                          <p className="mt-1.5 text-[11px] text-slate-400">Applied to selected numeric columns. log1p and √x treat negatives as 0.</p>
+                          <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">Output</label>
+                          <div className="flex gap-1.5">
+                            {(["replace", "new_columns"] as NonNullable<MathStep["output_mode"]>[]).map((mode) => (
+                              <button
+                                key={mode}
+                                type="button"
+                                onClick={() => updateStep(step.id, { output_mode: mode } as Partial<Step>)}
+                                className={edaOptChip(
+                                  ((step as MathStep).output_mode ?? "replace") === mode,
+                                  "flex-1 py-2 text-[11px]",
+                                )}
+                              >
+                                {mode === "replace" ? "Replace" : "New columns"}
+                              </button>
+                            ))}
+                          </div>
+                          <p className="text-[11px] text-slate-400">
+                            {(step as MathStep).output_mode === "new_columns"
+                              ? "Adds prefixed columns (e.g. log1p_col)."
+                              : "Overwrites selected columns; log1p and √x treat negatives as 0."}
+                          </p>
                         </div>
                       )}
                       {step.type === "fix_skewness" && (
@@ -1920,6 +2601,8 @@ function QuickTransformPanel({
                 </div>
               </div>
             ))}
+              </div>
+            )}
           </div>
 
           {steps.length > 0 && (
@@ -1970,9 +2653,20 @@ function stepSummary(step: Record<string, unknown>): string {
     case "impute":          return `${colStr} (${step.strategy})`;
     case "one_hot_encode":  return colStr;
     case "label_encode":    return colStr;
-    case "clip_outliers":   return `${colStr} (${step.method})`;
+    case "clip_outliers": {
+      const m = step.method as string;
+      if (m === "percentile") {
+        const lo = typeof step.p_low === "number" ? step.p_low : 0.01;
+        const hi = typeof step.p_high === "number" ? step.p_high : 0.99;
+        return `${colStr} (p${Math.round(lo * 100)}–p${Math.round(hi * 100)})`;
+      }
+      return `${colStr} (${m})`;
+    }
     case "scale":           return `${colStr} (${step.method})`;
-    case "math_transform":  return `${colStr} (${step.method})`;
+    case "math_transform": {
+      const mode = step.output_mode === "new_columns" ? "new cols" : "replace";
+      return `${colStr} (${step.method} · ${mode})`;
+    }
     case "fix_skewness":    return `${colStr} (${step.method}, |skew|≥${step.threshold})`;
     case "bin_numeric":     return `${colStr} (${step.n_bins} bins, ${step.strategy})`;
     case "drop_duplicates": return cols.length ? colStr : "all columns";
@@ -2271,6 +2965,22 @@ export default function EDA({ datasetId, transformSyncKey = 0, onTransformsMutat
     return transformHistory.steps.map((raw) => deserializeStep(raw as Record<string, unknown>));
   }, [transformHistory]);
 
+  const goNextEdaTab = useCallback(() => {
+    setSearchParams(
+      (p) => {
+        const cur = (p.get("tab") ?? "health") as EdaTabId;
+        const idx = EDA_TAB_ORDER.includes(cur) ? EDA_TAB_ORDER.indexOf(cur) : 0;
+        const next = EDA_TAB_ORDER[(idx + 1) % EDA_TAB_ORDER.length];
+        p.set("tab", next);
+        return p;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
+
+  const transformActive = Boolean(transformHistory?.active);
+  const columnsOriginal = edaOriginal?.columns ?? [];
+
   if (!datasetId) return <PageShell title="EDA"><p className="text-sm text-slate-500">Upload a dataset first.</p></PageShell>;
   if (loading) {
     return (
@@ -2281,36 +2991,28 @@ export default function EDA({ datasetId, transformSyncKey = 0, onTransformsMutat
   }
   if (!eda) return <PageShell title="EDA"><p className="text-sm text-slate-500">No data available.</p></PageShell>;
 
-  const transformActive = Boolean(transformHistory?.active);
-  const columnsOriginal = edaOriginal?.columns ?? [];
-
   return (
     <PageShell
       title="EDA"
       description={`${eda.shape[0].toLocaleString()} rows × ${eda.columns.length} numeric columns`}
     >
+      <EdaDataRevisionContext.Provider value={transformSyncKey}>
       <p className="mb-3 max-w-3xl text-xs leading-relaxed text-slate-500">
-        Optional transforms update the <span className="font-medium text-slate-600">working dataset</span> used for every tab below and for training, until you revert.
+        Use the tab strips to pick a view; <span className="font-medium text-slate-600">Quick transforms</span> update the working dataset for charts and training until you revert.
       </p>
-      <QuickTransformPanel
-        datasetId={datasetId}
-        allColumns={allColumns}
-        onApplied={() => onTransformsMutated?.()}
-        queueSeed={quickQueueSeed}
-        onQueueSeedConsumed={clearQuickQueueSeed}
-      />
-      {transformHistory && (
-        <TransformBanner
-          history={transformHistory}
-          datasetId={datasetId}
-          onReverted={() => onTransformsMutated?.()}
-          allColumns={allColumns}
-          onRequestEditPipeline={(steps) => setQuickQueueSeed({ key: Date.now(), steps })}
-        />
-      )}
       <Tabs value={activeTab} onValueChange={(t) => setSearchParams((p) => { p.set("tab", t); return p; }, { replace: true })}>
-        <TabsList className="flex-wrap h-auto">
+        <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+          Dataset check
+        </p>
+        <TabsList className="mb-3 flex-wrap h-auto">
           <TabsTrigger value="health">Health</TabsTrigger>
+          <TabsTrigger value="recommendations">Recommendations</TabsTrigger>
+        </TabsList>
+
+        <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+          Explore
+        </p>
+        <TabsList className="mb-4 flex-wrap h-auto">
           <TabsTrigger value="target">Target</TabsTrigger>
           <TabsTrigger value="skewness">Skewness</TabsTrigger>
           <TabsTrigger value="boxplot">Box Plots</TabsTrigger>
@@ -2327,59 +3029,137 @@ export default function EDA({ datasetId, transformSyncKey = 0, onTransformsMutat
           </TabsTrigger>
         </TabsList>
 
-        <TabsContent value="health"><HealthTab datasetId={datasetId} transformActive={transformActive} /></TabsContent>
-        <TabsContent value="target">
-          <TargetTab
+        <div className="border-t border-slate-200 pt-6">
+          <p className="mb-3 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+            Quick transforms
+          </p>
+          <QuickTransformPanel
             datasetId={datasetId}
-            columns={eda.columns}
-            columnsOriginal={columnsOriginal}
-            transformActive={transformActive}
+            allColumns={allColumns}
+            onApplied={() => onTransformsMutated?.()}
+            queueSeed={quickQueueSeed}
+            onQueueSeedConsumed={clearQuickQueueSeed}
           />
+          {transformHistory && (
+            <TransformBanner
+              history={transformHistory}
+              datasetId={datasetId}
+              onReverted={() => onTransformsMutated?.()}
+              allColumns={allColumns}
+              onRequestEditPipeline={(steps) => setQuickQueueSeed({ key: Date.now(), steps })}
+            />
+          )}
+        </div>
+
+        <TabsContent value="health" className="mt-6">
+          <EdaTabWithNext tabId="health" onNext={goNextEdaTab}>
+            <HealthTab datasetId={datasetId} transformActive={transformActive} />
+          </EdaTabWithNext>
         </TabsContent>
-        <TabsContent value="skewness"><SkewnessTab datasetId={datasetId} transformActive={transformActive} /></TabsContent>
-        <TabsContent value="boxplot">
-          <BoxplotTab
-            datasetId={datasetId}
-            columns={eda.columns}
-            columnsOriginal={columnsOriginal}
-            transformActive={transformActive}
-          />
+        <TabsContent value="recommendations" className="mt-6">
+          <EdaTabWithNext tabId="recommendations" onNext={goNextEdaTab}>
+            <RecommendationsTab
+              datasetId={datasetId}
+              transformActive={transformActive}
+              transformSyncKey={transformSyncKey}
+              onTransformsMutated={onTransformsMutated}
+              columns={eda.columns}
+              columnsOriginal={columnsOriginal}
+            />
+          </EdaTabWithNext>
         </TabsContent>
-        <TabsContent value="pairplot">
-          <PairplotTab
-            datasetId={datasetId}
-            columns={eda.columns}
-            columnsOriginal={columnsOriginal}
-            transformActive={transformActive}
-          />
+
+        <TabsContent value="target" className="mt-6">
+          <EdaTabWithNext tabId="target" onNext={goNextEdaTab}>
+            <TargetTab
+              datasetId={datasetId}
+              columns={eda.columns}
+              columnsOriginal={columnsOriginal}
+              transformActive={transformActive}
+            />
+          </EdaTabWithNext>
         </TabsContent>
-        <TabsContent value="feature-target">
-          <FeatureTargetTab
-            datasetId={datasetId}
-            columns={eda.columns}
-            columnsOriginal={columnsOriginal}
-            transformActive={transformActive}
-          />
+        <TabsContent value="skewness" className="mt-6">
+          <EdaTabWithNext tabId="skewness" onNext={goNextEdaTab}>
+            <SkewnessTab datasetId={datasetId} transformActive={transformActive} />
+          </EdaTabWithNext>
         </TabsContent>
-        <TabsContent value="stats">
-          <StatsTab eda={eda} edaOriginal={edaOriginal} transformActive={transformActive} />
+        <TabsContent value="boxplot" className="mt-6">
+          <EdaTabWithNext tabId="boxplot" onNext={goNextEdaTab}>
+            <BoxplotTab
+              datasetId={datasetId}
+              columns={eda.columns}
+              columnsOriginal={columnsOriginal}
+              transformActive={transformActive}
+            />
+          </EdaTabWithNext>
         </TabsContent>
-        <TabsContent value="heatmap"><HeatmapTab datasetId={datasetId} transformActive={transformActive} /></TabsContent>
-        <TabsContent value="scatter">
-          <ScatterTab
-            datasetId={datasetId}
-            columns={eda.columns}
-            columnsOriginal={columnsOriginal}
-            transformActive={transformActive}
-          />
+        <TabsContent value="pairplot" className="mt-6">
+          <EdaTabWithNext tabId="pairplot" onNext={goNextEdaTab}>
+            <PairplotTab
+              datasetId={datasetId}
+              columns={eda.columns}
+              columnsOriginal={columnsOriginal}
+              transformActive={transformActive}
+            />
+          </EdaTabWithNext>
         </TabsContent>
-        <TabsContent value="missing"><MissingTab datasetId={datasetId} transformActive={transformActive} /></TabsContent>
-        <TabsContent value="outliers"><OutliersTab datasetId={datasetId} transformActive={transformActive} /></TabsContent>
-        <TabsContent value="categorical"><CategoricalTab datasetId={datasetId} transformActive={transformActive} /></TabsContent>
-        <TabsContent value="transform-warnings">
-          <EdaTransformWarningsTab steps={appliedStepsForWarnings} allColumns={allColumns} />
+        <TabsContent value="feature-target" className="mt-6">
+          <EdaTabWithNext tabId="feature-target" onNext={goNextEdaTab}>
+            <FeatureTargetTab
+              datasetId={datasetId}
+              columns={eda.columns}
+              columnsOriginal={columnsOriginal}
+              transformActive={transformActive}
+            />
+          </EdaTabWithNext>
+        </TabsContent>
+        <TabsContent value="stats" className="mt-6">
+          <EdaTabWithNext tabId="stats" onNext={goNextEdaTab}>
+            <StatsTab eda={eda} edaOriginal={edaOriginal} transformActive={transformActive} />
+          </EdaTabWithNext>
+        </TabsContent>
+        <TabsContent value="heatmap" className="mt-6">
+          <EdaTabWithNext tabId="heatmap" onNext={goNextEdaTab}>
+            <HeatmapTab
+              datasetId={datasetId}
+              transformActive={transformActive}
+              onQueuePolynomialSteps={(steps) => setQuickQueueSeed({ key: Date.now(), steps })}
+            />
+          </EdaTabWithNext>
+        </TabsContent>
+        <TabsContent value="scatter" className="mt-6">
+          <EdaTabWithNext tabId="scatter" onNext={goNextEdaTab}>
+            <ScatterTab
+              datasetId={datasetId}
+              columns={eda.columns}
+              columnsOriginal={columnsOriginal}
+              transformActive={transformActive}
+            />
+          </EdaTabWithNext>
+        </TabsContent>
+        <TabsContent value="missing" className="mt-6">
+          <EdaTabWithNext tabId="missing" onNext={goNextEdaTab}>
+            <MissingTab datasetId={datasetId} transformActive={transformActive} />
+          </EdaTabWithNext>
+        </TabsContent>
+        <TabsContent value="outliers" className="mt-6">
+          <EdaTabWithNext tabId="outliers" onNext={goNextEdaTab}>
+            <OutliersTab datasetId={datasetId} transformActive={transformActive} />
+          </EdaTabWithNext>
+        </TabsContent>
+        <TabsContent value="categorical" className="mt-6">
+          <EdaTabWithNext tabId="categorical" onNext={goNextEdaTab}>
+            <CategoricalTab datasetId={datasetId} transformActive={transformActive} />
+          </EdaTabWithNext>
+        </TabsContent>
+        <TabsContent value="transform-warnings" className="mt-6">
+          <EdaTabWithNext tabId="transform-warnings" onNext={goNextEdaTab}>
+            <EdaTransformWarningsTab steps={appliedStepsForWarnings} allColumns={allColumns} />
+          </EdaTabWithNext>
         </TabsContent>
       </Tabs>
+      </EdaDataRevisionContext.Provider>
     </PageShell>
   );
 }

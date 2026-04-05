@@ -2,7 +2,17 @@ import { Check, Copy, Info, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
 
-type Page = "upload" | "eda" | "transforms" | "train" | "experiments" | "importances" | "diagnostics" | "predict";
+type Page =
+  | "upload"
+  | "split"
+  | "eda"
+  | "transforms"
+  | "train"
+  | "experiments"
+  | "importances"
+  | "diagnostics"
+  | "export"
+  | "predict";
 
 interface HParamDoc {
   name: string;
@@ -31,7 +41,7 @@ const CONTENT: Record<Page, { title: string; summary: string; sections: Section[
       {
         heading: "Loading & splitting data",
         tab: "Load & split",
-        body: "pandas reads the CSV. If you did not add a Train/Test Split step in Transforms, the Train tab uses sklearn's train_test_split (default 20% test). For classification targets with fewer than 20 unique values the split can be stratified to preserve class balance.",
+        body: "pandas reads the CSV. Save a hold-out on the Split tab before Transforms; the Train tab then uses __ml_split__ and skips its own random split when that column is present. Otherwise Train falls back to sklearn train_test_split (default 20% test).",
         code: `import pandas as pd
 from sklearn.model_selection import train_test_split
 
@@ -61,10 +71,30 @@ print(task)  # "regression" for quality 0-10`,
     ],
   },
 
+  split: {
+    title: "Hold-out split",
+    summary:
+      "Assign every row to train or test on a copy of your original upload. This must be saved before Transforms or EDA quick-apply steps run, so the evaluation set is fixed before preprocessing.",
+    sections: [
+      {
+        heading: "Why a separate tab",
+        tab: "Overview",
+        body: "The Split tab writes __ml_split__ from sklearn’s train_test_split on row indices (with optional stratification). Saving clears any prior transform pipeline and replaces the working CSV. Re-saving after Reset to original reuses your stored options.",
+        code: `from sklearn.model_selection import train_test_split
+
+idx_train, idx_test = train_test_split(
+    df.index, test_size=0.2, random_state=42, stratify=y
+)
+df.loc[idx_train, "__ml_split__"] = "train"
+df.loc[idx_test, "__ml_split__"] = "test"`,
+      },
+    ],
+  },
+
   eda: {
     title: "Exploratory Data Analysis",
     summary:
-      "Understand the data before modelling. EDA surfaces distributions, correlations, missing values, outliers, and categorical frequencies — all red flags that affect model quality.",
+      "Understand the data before modelling. EDA surfaces distributions, correlations, missing values, outliers, and categorical frequencies. The Recommendations tab turns those signals into suggested pipeline steps you can apply one-by-one or all at once.",
     sections: [
       {
         heading: "Descriptive statistics",
@@ -111,6 +141,17 @@ pct     = missing / len(df) * 100
 
 summary = pd.DataFrame({"count": missing, "pct": pct})
 print(summary[summary["count"] > 0])`,
+      },
+      {
+        heading: "Transform recommendations",
+        tab: "Recommendations",
+        body: "Save hold-out on the Split tab first so __ml_split__ exists. Recommendations then distinguish table-level cleaning (e.g. drop constants) from steps you typically run after the split is fixed (impute, clip, skew fix, frequency encode). Quick-apply requires the split column. Pandas transforms still see all rows unless a step drops rows.",
+        code: `# Before split: table-level cleaning
+df = df.drop_duplicates()
+# After split: in sklearn, fit on X_train only
+from sklearn.impute import SimpleImputer
+imp = SimpleImputer(strategy="median").fit(X_train)
+X_test = imp.transform(X_test)`,
       },
       {
         heading: "Outlier detection (IQR)",
@@ -254,7 +295,7 @@ X_sp = vec.fit_transform(df["description"].fillna("").astype(str))`,
         heading: "Train/test split column (__ml_split__)",
         tab: "Split column",
         lang: "Python · sklearn · pandas",
-        body: "When the Train/Test Split step runs in Transforms, rows get __ml_split__ labels (train or test). Later steps keep that column unless a step removes it. The Train tab uses __ml_split__ when it is still present and skips its own hold-out split.",
+        body: "Use the Split tab to add __ml_split__ before Transforms. Older pipelines may still contain a legacy Train/Test Split transform step. The Train tab uses __ml_split__ when present and skips its own random hold-out.",
         code: `from sklearn.model_selection import train_test_split
 import pandas as pd
 import numpy as np
@@ -287,7 +328,7 @@ df["cat_te"] = df["cat_te"].fillna(m)`,
   experiments: {
     title: "Model Experiments",
     summary:
-      "Train multiple sklearn estimators, evaluate them on a held-out test set, and compare using cross-validation. MLflow logs every run so nothing is lost.",
+      "Browse MLflow runs for this dataset: test metrics, optional train metrics (after retraining), and CV. Charts and tables hide columns when older runs do not have them. For the MLflow UI, use the copyable command on this page so the UI reads the same store as the API (SQLite by default)—plain mlflow ui without --backend-store-uri points at a different ./mlruns folder and will not show these runs.",
     sections: [
       {
         heading: "Regression models",
@@ -344,18 +385,26 @@ print(f"ROC-AUC  : {roc_auc_score(y_test, y_prob, multi_class='ovr'):.4f}")`,
       },
       {
         heading: "MLflow tracking",
-        body: "Every run logs params, metrics, and the serialised model. Switch to a SQLite backend to persist across restarts.",
+        tab: "MLflow",
+        body: "The API defaults to an absolute SQLite path next to main.py (see backend logs for the exact URI). Every run logs params, metrics (including train_* metrics for newer runs), and the model artifact. To open the MLflow UI for that same database, run mlflow ui with --backend-store-uri set to that URI—not plain mlflow ui, which uses ./mlruns in your shell’s current directory and is a separate, unrelated store.",
         code: `import mlflow
 import mlflow.sklearn
 
-mlflow.set_tracking_uri("sqlite:///mlruns.db")
-mlflow.set_experiment("wine-quality")
+# Use an ABSOLUTE path in the URI (three slashes after sqlite: + path)
+# Example: sqlite:////Users/you/proj/ml-studio/backend/mlruns.db
+mlflow.set_tracking_uri("sqlite:////ABSOLUTE/PATH/TO/backend/mlruns.db")
+mlflow.set_experiment("dataset-<your_dataset_id>")
 
 with mlflow.start_run(run_name="random_forest"):
     mlflow.log_param("n_estimators", 100)
     mlflow.log_metric("rmse", rmse)
-    mlflow.log_metric("r2",   r2)
-    mlflow.sklearn.log_model(model, "model")`,
+    mlflow.log_metric("train_rmse", rmse_train)
+    mlflow.log_metric("r2", r2)
+    mlflow.sklearn.log_model(model, "model")
+
+# UI (same machine): from backend/, recommended:
+# uv run python mlflow_ui_cli.py
+# Or copy the full mlflow ui --backend-store-uri ... command from Experiments.`,
       },
       {
         heading: "Hyperparameter reference",
@@ -403,8 +452,24 @@ GradientBoostingRegressor(
   importances: {
     title: "Feature Importances",
     summary:
-      "Understand which inputs drive predictions. Tree models expose built-in split-based importances; linear models use |coefficient| × feature std as a proxy.",
+      "Compare how much each model relies on every feature. Select any subset of trained models (or use Select all); importances load in parallel and are shown as stacked bars per feature. Tree models use built-in split importances; linear models use |coefficient| × feature std as a proxy.",
     sections: [
+      {
+        heading: "Comparing runs",
+        tab: "Compare",
+        body: "Each checkbox is one MLflow run (same algorithm name can appear more than once after retraining). Labels show the last 8 characters of the run id and the start time when available. Select all includes every run; Single only keeps one. The API loads importances from the exact run you select. Features are ordered by the highest importance among selected runs.",
+        code: `# Conceptually: one GET /importances/{dataset_id}/{model_name} per selected model,
+# then align rows by feature name and plot normalized bar widths.
+
+import pandas as pd
+
+# Example: two model importance series aligned on columns
+s_a = pd.Series({...}, name="gradient_boosting")
+s_b = pd.Series({...}, name="random_forest")
+df = pd.concat([s_a, s_b], axis=1).fillna(0)
+df["max"] = df.max(axis=1)
+df = df.sort_values("max", ascending=False)`,
+      },
       {
         heading: "Tree-based importances",
         body: "feature_importances_ is the mean decrease in impurity (Gini / variance) across all trees, normalised to sum to 1.",
@@ -457,7 +522,7 @@ print(imp.sort_values(ascending=False))`,
   diagnostics: {
     title: "Model diagnostics",
     summary:
-      "Hold-out evaluation: confusion matrix and report for classification; ROC and calibration for binary; residuals and learning curve for regression; permutation importance for any task.",
+      "Hold-out evaluation: confusion matrix and report for classification; ROC and calibration for binary; residuals, learning curve, and scaler baseline for regression; permutation importance for any task. Learning curve titles follow the metric (accuracy vs RMSE), with short guidance on underfitting, overfitting, and convergence.",
     sections: [
       {
         heading: "What you see",
@@ -469,14 +534,48 @@ from sklearn.inspection import permutation_importance
 # ROC / calibration need predict_proba (classifiers)
 # Learning curve retrains on growing subsets (regression)`,
       },
+      {
+        heading: "Learning curves",
+        tab: "Learning curve",
+        body: "The chart plots mean train score vs mean CV validation score as training set size grows. For accuracy, higher is better; for RMSE, lower is better on both lines. If both curves stay poor, the model may be underfitting. If train and validation stay far apart with little convergence, variance or overfitting is more likely. When the curves meet and flatten, collecting more data may help less.",
+        code: `from sklearn.model_selection import learning_curve
+import numpy as np
+
+# Regression example (negated RMSE for sklearn API)
+train_sizes, train_scores, val_scores = learning_curve(
+    estimator, X_train, y_train,
+    train_sizes=np.linspace(0.1, 1.0, 5),
+    cv=2,
+    scoring="neg_root_mean_squared_error",
+)
+# Plot train_scores.mean(axis=1) vs val_scores.mean(axis=1)`,
+      },
     ],
   },
 
   train: {
     title: "Train",
     summary:
-      "Select a target column, pick regression or classification, tune hyperparameters per model, then run training. Every run is tracked in MLflow so you can compare iterations in Experiments.",
+      "Select a target column, validation strategy, and models, then train. Results show train (in-sample), hold-out test, and CV metrics side by side, plus short fit hints (e.g. train vs test gap, CV spread). Learning curves live on Diagnostics. Every run is logged to MLflow (same store as Experiments).",
     sections: [
+      {
+        heading: "Results: train, CV, and test",
+        tab: "Metrics table",
+        body: "Train columns are computed on the full training matrix after pipeline fit. Test columns are the held-out split (__ml_split__ or your configured test fraction). CV is cross-validation on training data only (strategy from Split & Validation). CV σ is the standard deviation of fold scores when available. Fit hints are conservative heuristics, not ground truth. For learning curves, open Diagnostics after training and pick the same model.",
+        code: `# Same idea as sklearn: fit on X_train, then
+y_pred_train = pipe.predict(X_train)
+y_pred_test  = pipe.predict(X_test)
+
+# e.g. regression
+from sklearn.metrics import r2_score, mean_squared_error
+import numpy as np
+
+r2_train = r2_score(y_train, y_pred_train)
+r2_test  = r2_score(y_test, y_pred_test)
+rmse_test = np.sqrt(mean_squared_error(y_test, y_pred_test))
+
+# CV: cross_val_score on (X_train, y_train) only`,
+      },
       {
         heading: "Auto-detecting task type",
         body: "If the target has fewer than 20 unique integer values the backend treats it as classification, otherwise regression. You can always override.",
@@ -567,6 +666,32 @@ GradientBoostingRegressor(
           { name: "subsample", type: "float", default: "1.0", description: "Row fraction per tree in GB. Values 0.5–0.8 add regularisation." },
           { name: "min_samples_split", type: "int", default: "2", description: "Min samples to split a node. Higher prunes small noisy branches." },
         ],
+      },
+    ],
+  },
+
+  export: {
+    title: "Pipeline export",
+    summary:
+      "Download the fitted sklearn Pipeline as a gzip-compressed joblib file (same serialization the backend uses for MLflow). Load it in Python with joblib.load and call predict on a DataFrame whose columns match the training feature space (no target, no __ml_split__).",
+    sections: [
+      {
+        heading: "Download",
+        tab: "Download",
+        body: "Pick a model that has been trained on the active dataset. The browser saves a .joblib file. You need the same library versions (sklearn, xgboost if used, etc.) as the training environment for unpickling to work reliably.",
+        code: `# Equivalent endpoint (auth header if API_KEY is set):
+# GET /export/{dataset_id}/{model_name}/pipeline.joblib`,
+      },
+      {
+        heading: "Load and predict",
+        tab: "joblib.load",
+        body: "joblib transparently decompresses gzip. Build X with the same column names the pipeline expects—after training, those names are stored on the dataset record. The Export page generates a starter snippet using EDA means for numeric fields.",
+        code: `import joblib
+import pandas as pd
+
+pipe = joblib.load("random_forest_pipeline.joblib")
+X = pd.DataFrame([{"feature_a": 1.2, "feature_b": 3.4}])
+print(pipe.predict(X))`,
       },
     ],
   },

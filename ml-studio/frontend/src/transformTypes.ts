@@ -33,10 +33,23 @@ export interface DropStep       extends StepBase { type: "drop_columns";      co
 export interface ImputeStep     extends StepBase { type: "impute";             columns: string[]; strategy: "mean" | "median" | "mode" | "zero" }
 export interface OneHotStep     extends StepBase { type: "one_hot_encode";     columns: string[] }
 export interface LabelEncStep   extends StepBase { type: "label_encode";       columns: string[] }
-export interface ClipStep       extends StepBase { type: "clip_outliers";      columns: string[]; method: "iqr" | "zscore" }
+export interface ClipStep extends StepBase {
+  type: "clip_outliers";
+  columns: string[];
+  method: "iqr" | "zscore" | "percentile";
+  /** Used when method is percentile (0–1 quantiles, default 1st–99th). */
+  p_low?: number;
+  p_high?: number;
+}
 export interface ScaleStep      extends StepBase { type: "scale";              columns: string[]; method: "standard" | "minmax" | "robust" }
 export interface RenameStep     extends StepBase { type: "rename_columns";     mapping: Record<string, string> }
-export interface MathStep       extends StepBase { type: "math_transform";     columns: string[]; method: "log1p" | "sqrt" | "square" | "reciprocal" | "abs" }
+export interface MathStep extends StepBase {
+  type: "math_transform";
+  columns: string[];
+  method: "log1p" | "sqrt" | "square" | "reciprocal" | "abs";
+  /** replace = overwrite column; new_columns = add log1p_col, sqrt_col, … */
+  output_mode?: "replace" | "new_columns";
+}
 export interface FixSkewStep    extends StepBase { type: "fix_skewness";        columns: string[]; method: "auto" | "log1p" | "sqrt" | "box_cox" | "yeo_johnson"; threshold: number }
 export interface BinStep        extends StepBase { type: "bin_numeric";        columns: string[]; n_bins: number; strategy: "equal_width" | "quantile" }
 export interface DropDupStep    extends StepBase { type: "drop_duplicates";    columns: string[]; keep: "first" | "last" | "none" }
@@ -101,9 +114,9 @@ export const STEP_META: Record<StepType, { label: string; description: string }>
   drop_nulls:        { label: "Drop Null Rows",       description: "Remove rows that have missing values in any/all selected columns" },
   cast_dtype:        { label: "Cast Dtype",           description: "Convert column values to float, int, or string" },
   impute:            { label: "Impute Missing",       description: "Fill NaN values with a calculated statistic" },
-  clip_outliers:     { label: "Clip Outliers",        description: "Cap extreme values using IQR or Z-score bounds" },
+  clip_outliers:     { label: "Clip Outliers",        description: "Cap extremes with IQR, Z-score, or percentile band (e.g. 1st–99th)" },
   scale:             { label: "Scale / Normalise",    description: "Standardise or normalise numeric column values" },
-  math_transform:    { label: "Math Transform",       description: "Apply log1p, sqrt, square, reciprocal, or abs to numeric columns" },
+  math_transform:    { label: "Math Transform",       description: "Apply log1p, sqrt, etc. in place or as new columns (log1p_feat, …)" },
   fix_skewness:      { label: "Fix Skewness",         description: "Auto-correct skewed distributions using log1p, sqrt, Box-Cox, or Yeo-Johnson — skips columns below the threshold" },
   bin_numeric:       { label: "Bin Numeric",          description: "Discretise a numeric column into equal-width or quantile bins" },
   one_hot_encode:    { label: "One-Hot Encode",       description: "Encode categorical column as binary dummy variables" },
@@ -115,7 +128,7 @@ export const STEP_META: Record<StepType, { label: string; description: string }>
   tfidf_column:      { label: "TF‑IDF (text column)", description: "Vectorise one text column into a bag of TF‑IDF numeric features (max 200 terms)" },
   derive_numeric:    { label: "Derive Column (arithmetic)", description: "Create a new numeric column from two columns using +, −, ×, or ÷" },
   target_encode_dataset: { label: "Target Encode (dataset)", description: "Replace categories with mean target (uses full data — can leak; prefer Train tab target encoding for modeling)" },
-  train_test_split: { label: "Train / Test Split", description: "Label each row as train or test (adds __ml_split__). Reorder like any other step. Train tab uses __ml_split__ when that column remains after all steps." },
+  train_test_split: { label: "Train / Test Split (legacy)", description: "Deprecated — use the Split tab. Kept for older saved pipelines only." },
 };
 
 /** UI grouping for searchable transform pickers (EDA Quick Transform, Transforms add-step). */
@@ -127,17 +140,16 @@ export const TRANSFORM_OPTION_GROUPS: { category: string; types: readonly StepTy
   { category: "Distributions", types: ["math_transform", "fix_skewness", "bin_numeric"] },
   { category: "Encoding", types: ["one_hot_encode", "label_encode", "frequency_encode", "target_encode_dataset"] },
   { category: "Feature engineering", types: ["polynomial_features", "extract_datetime", "pca_projection", "tfidf_column", "derive_numeric"] },
-  { category: "Modeling prep", types: ["train_test_split"] },
 ];
 
 export function makeStep(type: StepType): Step {
   const id = Math.random().toString(36).slice(2, 8);
   switch (type) {
     case "impute":           return { id, type, columns: [], strategy: "mean" };
-    case "clip_outliers":    return { id, type, columns: [], method: "iqr" };
+    case "clip_outliers":    return { id, type, columns: [], method: "iqr", p_low: 0.01, p_high: 0.99 };
     case "scale":            return { id, type, columns: [], method: "standard" };
     case "rename_columns":   return { id, type, mapping: {} };
-    case "math_transform":   return { id, type, columns: [], method: "log1p" };
+    case "math_transform":   return { id, type, columns: [], method: "log1p", output_mode: "replace" };
     case "fix_skewness":     return { id, type, columns: [], method: "auto", threshold: 0.5 };
     case "bin_numeric":      return { id, type, columns: [], n_bins: 5, strategy: "equal_width" };
     case "drop_duplicates":  return { id, type, columns: [], keep: "first" };
@@ -178,7 +190,26 @@ export function serializeStep(s: Step): object {
 
 /** Re-attach a random id to a raw step object coming from the API */
 export function deserializeStep(raw: Record<string, unknown>): Step {
-  return { id: Math.random().toString(36).slice(2, 8), ...raw } as Step;
+  const id = Math.random().toString(36).slice(2, 8);
+  const t = raw.type as string;
+  if (t === "clip_outliers") {
+    const method =
+      raw.method === "percentile" || raw.method === "iqr" || raw.method === "zscore"
+        ? raw.method
+        : "iqr";
+    return {
+      ...raw,
+      id,
+      method,
+      p_low: typeof raw.p_low === "number" && Number.isFinite(raw.p_low) ? raw.p_low : 0.01,
+      p_high: typeof raw.p_high === "number" && Number.isFinite(raw.p_high) ? raw.p_high : 0.99,
+    } as Step;
+  }
+  if (t === "math_transform") {
+    const output_mode = raw.output_mode === "new_columns" ? "new_columns" : "replace";
+    return { ...raw, id, output_mode } as Step;
+  }
+  return { id, ...raw } as Step;
 }
 
 /** Clone steps for editing in the UI (fresh ids; same serialized payload as server). */

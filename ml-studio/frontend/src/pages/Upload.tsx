@@ -20,6 +20,7 @@ interface UploadProps {
   onClearDataset: () => void;
   onDatasetCreated: (id: string) => void;
   onNavigateToTrain: () => void;
+  onNavigateToSplit: () => void;
 }
 
 export default function Upload({
@@ -27,6 +28,7 @@ export default function Upload({
   onClearDataset,
   onDatasetCreated,
   onNavigateToTrain,
+  onNavigateToSplit,
 }: UploadProps) {
   const [file, setFile]           = useState<File | null>(null);
   const [url, setUrl]             = useState("");
@@ -218,17 +220,22 @@ export default function Upload({
                 </table>
               </div>
 
-              {/* CTA to Train */}
-              <div className="flex items-center gap-3 p-4 bg-blue-50 border border-blue-200 rounded-xl">
+              {/* CTA: split before transforms / train */}
+              <div className="flex flex-col gap-3 p-4 bg-blue-50 border border-blue-200 rounded-xl sm:flex-row sm:items-center">
                 <div className="flex-1">
-                  <p className="text-sm font-semibold text-blue-900">Dataset ready to train</p>
+                  <p className="text-sm font-semibold text-blue-900">Next: hold-out split</p>
                   <p className="text-xs text-blue-600 mt-0.5">
-                    Go to <strong>Train</strong> to select a target column, configure hyperparameters, and run training.
+                    Open <strong>Split</strong> to label train vs test rows on your upload (required before Transforms). Then use <strong>Train</strong> for models.
                   </p>
                 </div>
-                <Button onClick={onNavigateToTrain} size="sm" className="shrink-0">
-                  Train <ArrowRight className="w-3.5 h-3.5" />
-                </Button>
+                <div className="flex shrink-0 flex-wrap gap-2">
+                  <Button onClick={onNavigateToSplit} size="sm" className="gap-1">
+                    Split <ArrowRight className="w-3.5 h-3.5" />
+                  </Button>
+                  <Button onClick={onNavigateToTrain} size="sm" variant="outline">
+                    Train
+                  </Button>
+                </div>
               </div>
             </CardContent>
           </Card>

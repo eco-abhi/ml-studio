@@ -3,36 +3,53 @@ import {
   BarChart2,
   Cpu,
   Database,
+  FileDown,
   FlaskConical,
   HelpCircle,
   Layers,
   SlidersHorizontal,
   Sparkles,
+  SplitSquareHorizontal,
   Upload,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { InfoDrawer } from "./components/InfoDrawer";
-import { cn } from "./lib/utils";
+import { SidebarWorkflowNav } from "./components/SidebarWorkflowNav";
+import { WorkflowNextBar } from "./components/WorkflowNextBar";
 import EDA from "./pages/EDA";
 import Experiments from "./pages/Experiments";
 import Diagnostics from "./pages/Diagnostics";
 import Importances from "./pages/Importances";
+import PipelineExport from "./pages/PipelineExport";
 import Predict from "./pages/Predict";
 import Train from "./pages/Train";
+import HoldoutSplit from "./pages/HoldoutSplit";
 import Transforms from "./pages/Transforms";
 import UploadPage from "./pages/Upload";
 
-type Page = "upload" | "eda" | "transforms" | "train" | "experiments" | "importances" | "diagnostics" | "predict";
+type Page =
+  | "upload"
+  | "split"
+  | "eda"
+  | "transforms"
+  | "train"
+  | "experiments"
+  | "importances"
+  | "diagnostics"
+  | "export"
+  | "predict";
 
 const NAV: { key: Page; path: string; label: string; icon: React.ElementType; group: string }[] = [
   { key: "upload",      path: "/",             label: "Upload",      icon: Upload,            group: "Data"   },
+  { key: "split",       path: "/split",        label: "Split",       icon: SplitSquareHorizontal, group: "Data" },
   { key: "eda",         path: "/eda",           label: "EDA",         icon: BarChart2,         group: "Data"   },
   { key: "transforms",  path: "/transforms",   label: "Transforms",  icon: SlidersHorizontal, group: "Data"   },
   { key: "train",       path: "/train",         label: "Train",       icon: Cpu,               group: "Models" },
   { key: "experiments", path: "/experiments",   label: "Experiments", icon: FlaskConical,      group: "Models" },
   { key: "importances", path: "/importances",   label: "Importances", icon: Layers,            group: "Models" },
   { key: "diagnostics", path: "/diagnostics",   label: "Diagnostics", icon: Activity,          group: "Models" },
+  { key: "export",      path: "/export",        label: "Export",      icon: FileDown,          group: "Models" },
   { key: "predict",     path: "/predict",       label: "Predict",     icon: Sparkles,          group: "Models" },
 ];
 
@@ -96,12 +113,13 @@ export default function App() {
 
   const goTo = (path: string) => navigate({ pathname: path, search: buildSearch(datasetId) });
 
-  const groups = Array.from(new Set(NAV.map((n) => n.group)));
+  const navIndex = NAV.findIndex((n) => n.key === page);
+  const nextNav = navIndex >= 0 && navIndex < NAV.length - 1 ? NAV[navIndex + 1] : null;
 
   return (
-    <div className="flex min-h-screen bg-slate-50">
+    <div className="flex h-screen min-h-0 overflow-hidden bg-slate-50">
       {/* ── Sidebar ──────────────────────────────────────────────────────── */}
-      <aside className="w-56 bg-slate-900 flex flex-col fixed inset-y-0 left-0 z-40">
+      <aside className="w-[15.5rem] bg-slate-900 flex flex-col fixed inset-y-0 left-0 z-40 border-r border-slate-800/80">
         {/* Logo */}
         <div className="px-5 py-5 border-b border-slate-800">
           <div className="flex items-center gap-2.5">
@@ -117,33 +135,12 @@ export default function App() {
           </div>
         </div>
 
-        {/* Nav */}
-        <nav className="flex-1 px-3 py-4 space-y-5 overflow-y-auto">
-          {groups.map((group) => (
-            <div key={group}>
-              <p className="px-2 mb-1.5 text-xs font-semibold uppercase tracking-wider text-slate-500">
-                {group}
-              </p>
-              <div className="space-y-0.5">
-                {NAV.filter((n) => n.group === group).map(({ key, path, label, icon: Icon }) => (
-                  <button
-                    key={key}
-                    onClick={() => goTo(path)}
-                    className={cn(
-                      "w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-colors",
-                      page === key
-                        ? "bg-blue-600 text-white font-medium"
-                        : "text-slate-400 hover:bg-slate-800 hover:text-slate-100"
-                    )}
-                  >
-                    <Icon className="w-4 h-4 shrink-0" />
-                    {label}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ))}
-        </nav>
+        <SidebarWorkflowNav
+          items={NAV}
+          activeIndex={navIndex}
+          currentKey={page}
+          onSelect={goTo}
+        />
 
         {/* Active dataset */}
         <div className="px-4 py-4 border-t border-slate-800 space-y-3">
@@ -177,36 +174,54 @@ export default function App() {
       <InfoDrawer open={drawerOpen} page={page} onClose={() => setDrawerOpen(false)} />
 
       {/* ── Main content — all pages stay mounted ────────────────────────── */}
-      <main className="ml-56 flex-1 min-h-screen overflow-y-auto">
-        <div className={page === "upload"      ? undefined : "hidden"}>
-          <UploadPage
-            currentDatasetId={datasetId}
-            onClearDataset={() => setDatasetId(null)}
-            onDatasetCreated={setDatasetId}
-            onNavigateToTrain={() => goTo("/train")}
-          />
+      <main className="ml-[15.5rem] flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div
+          className={
+            nextNav
+              ? "min-h-0 flex-1 overflow-y-auto pb-[5.25rem]"
+              : "min-h-0 flex-1 overflow-y-auto"
+          }
+        >
+          <div className={page === "upload"      ? undefined : "hidden"}>
+            <UploadPage
+              currentDatasetId={datasetId}
+              onClearDataset={() => setDatasetId(null)}
+              onDatasetCreated={setDatasetId}
+              onNavigateToTrain={() => goTo("/train")}
+              onNavigateToSplit={() => goTo("/split")}
+            />
+          </div>
+          <div className={page === "split"       ? undefined : "hidden"}>
+            <HoldoutSplit datasetId={datasetId} onHoldoutSaved={onTransformsMutated} />
+          </div>
+          <div className={page === "eda"         ? undefined : "hidden"}>
+            <EDA datasetId={datasetId} transformSyncKey={transformSyncKey} onTransformsMutated={onTransformsMutated} />
+          </div>
+          <div className={page === "transforms"  ? undefined : "hidden"}>
+            <Transforms datasetId={datasetId} transformSyncKey={transformSyncKey} onTransformsMutated={onTransformsMutated} />
+          </div>
+          <div className={page === "train"       ? undefined : "hidden"}>
+            <Train datasetId={datasetId} onTrainingComplete={onTrainingComplete} />
+          </div>
+          <div className={page === "experiments" ? undefined : "hidden"}>
+            <Experiments datasetId={datasetId} experimentsSyncKey={experimentsSyncKey} />
+          </div>
+          <div className={page === "importances" ? undefined : "hidden"}>
+            <Importances datasetId={datasetId} experimentsSyncKey={experimentsSyncKey} />
+          </div>
+          <div className={page === "diagnostics" ? undefined : "hidden"}>
+            <Diagnostics datasetId={datasetId} experimentsSyncKey={experimentsSyncKey} />
+          </div>
+          <div className={page === "export"      ? undefined : "hidden"}>
+            <PipelineExport datasetId={datasetId} experimentsSyncKey={experimentsSyncKey} />
+          </div>
+          <div className={page === "predict"     ? undefined : "hidden"}>
+            <Predict datasetId={datasetId} experimentsSyncKey={experimentsSyncKey} />
+          </div>
         </div>
-        <div className={page === "eda"         ? undefined : "hidden"}>
-          <EDA datasetId={datasetId} transformSyncKey={transformSyncKey} onTransformsMutated={onTransformsMutated} />
-        </div>
-        <div className={page === "transforms"  ? undefined : "hidden"}>
-          <Transforms datasetId={datasetId} transformSyncKey={transformSyncKey} onTransformsMutated={onTransformsMutated} />
-        </div>
-        <div className={page === "train"       ? undefined : "hidden"}>
-          <Train datasetId={datasetId} onTrainingComplete={onTrainingComplete} />
-        </div>
-        <div className={page === "experiments" ? undefined : "hidden"}>
-          <Experiments datasetId={datasetId} experimentsSyncKey={experimentsSyncKey} />
-        </div>
-        <div className={page === "importances" ? undefined : "hidden"}>
-          <Importances datasetId={datasetId} experimentsSyncKey={experimentsSyncKey} />
-        </div>
-        <div className={page === "diagnostics" ? undefined : "hidden"}>
-          <Diagnostics datasetId={datasetId} experimentsSyncKey={experimentsSyncKey} />
-        </div>
-        <div className={page === "predict"     ? undefined : "hidden"}>
-          <Predict datasetId={datasetId} experimentsSyncKey={experimentsSyncKey} />
-        </div>
+        {nextNav && (
+          <WorkflowNextBar nextLabel={nextNav.label} onNext={() => goTo(nextNav.path)} />
+        )}
       </main>
     </div>
   );

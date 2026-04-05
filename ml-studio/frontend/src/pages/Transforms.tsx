@@ -4,13 +4,16 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   applyTransform,
+  getHoldoutSplitStatus,
   getTransformHistory,
   previewDataset,
   previewTransform,
   resetTransform,
+  type HoldoutSplitStatus,
   type TransformApplyResult,
   type TransformPreview,
 } from "../api";
+import { DeriveTemplateQueue } from "../components/DeriveTemplateQueue";
 import { LoadingState } from "../components/LoadingState";
 import { RenameEditor } from "../components/RenameEditor";
 import { TransformTypePicker } from "../components/TransformTypePicker";
@@ -78,12 +81,22 @@ function stepSummary(step: Step): string {
       return Object.entries(step.mapping).map(([a, b]) => `${a}→${b}`).join(", ") || "—";
     case "impute":
       return `${_colsPreview(step.columns)} · ${step.strategy}`;
-    case "clip_outliers":
+    case "clip_outliers": {
+      const c = step as ClipStep;
+      if (c.method === "percentile") {
+        const lo = c.p_low ?? 0.01;
+        const hi = c.p_high ?? 0.99;
+        return `${_colsPreview(step.columns)} · p${Math.round(lo * 100)}–p${Math.round(hi * 100)}`;
+      }
       return `${_colsPreview(step.columns)} · ${step.method}`;
+    }
     case "scale":
       return `${_colsPreview(step.columns)} · ${step.method}`;
-    case "math_transform":
-      return `${_colsPreview(step.columns)} · ${step.method}`;
+    case "math_transform": {
+      const m = step as MathStep;
+      const mode = m.output_mode === "new_columns" ? "new cols" : "replace";
+      return `${_colsPreview(step.columns)} · ${step.method} · ${mode}`;
+    }
     case "fix_skewness":
       return `${_colsPreview(step.columns)} · ${step.method} (thr ${step.threshold})`;
     case "bin_numeric":
@@ -149,6 +162,7 @@ export default function Transforms({ datasetId, transformSyncKey = 0, onTransfor
   const [draggingAppliedIdx, setDraggingAppliedIdx] = useState<number | null>(null);
   const dragAppliedFromRef = useRef<number | null>(null);
   const [pipelineReady, setPipelineReady] = useState(false);
+  const [holdoutStatus, setHoldoutStatus] = useState<HoldoutSplitStatus | null>(null);
 
   useEffect(() => { setResult(null); setPreview(null); }, [pendingSteps]);
 
@@ -166,6 +180,9 @@ export default function Transforms({ datasetId, transformSyncKey = 0, onTransfor
       previewDataset(datasetId, 1)
         .then((r) => setColumns(r.columns))
         .catch(() => setColumns([])),
+      getHoldoutSplitStatus(datasetId)
+        .then(setHoldoutStatus)
+        .catch(() => setHoldoutStatus(null)),
     ]).finally(() => setPipelineReady(true));
   }, [datasetId]);
 
@@ -217,6 +234,9 @@ export default function Transforms({ datasetId, transformSyncKey = 0, onTransfor
       </PageShell>
     );
   }
+
+  /** New uploads must use the Split tab first; older datasets with a working CSV but no __ml_split__ still work. */
+  const transformsNeedSplitFirst = !holdoutStatus?.column_present && !hasActive;
 
   // ── Pending step CRUD ──
   const addStep   = () => setPendingSteps((p) => [...p, makeStep(addType)]);
@@ -424,6 +444,15 @@ export default function Transforms({ datasetId, transformSyncKey = 0, onTransfor
         </TabsList>
 
         <TabsContent value="pipeline" className="mt-0 focus-visible:outline-none">
+      {transformsNeedSplitFirst && (
+        <div className="mb-5 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950">
+          <p className="font-semibold">Hold-out split required first</p>
+          <p className="mt-1 text-xs leading-relaxed text-amber-900/95">
+            Open the <strong>Split</strong> tab and save train/test labels. Transforms run only after{" "}
+            <code className="rounded bg-white/80 px-1 text-[11px]">__ml_split__</code> exists on the working dataset.
+          </p>
+        </div>
+      )}
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_380px] gap-5">
         {/* ── Left ── */}
         <div className="space-y-5">
@@ -461,6 +490,14 @@ export default function Transforms({ datasetId, transformSyncKey = 0, onTransfor
               <div className="space-y-2" role="list" aria-label="Applied transform steps">
                 {appliedSteps.map((step, idx) => (
                   <div key={`${step.id}-${idx}`} className="space-y-2">
+                    {step.type === "train_test_split" && (
+                      <div className="rounded-lg border border-dashed border-amber-300 bg-amber-50/90 px-3 py-2.5 text-[11px] text-amber-950 leading-relaxed">
+                        <p className="font-semibold text-amber-950">Legacy train/test step</p>
+                        <p className="mt-1 text-amber-900/95">
+                          New pipelines assign hold-out on the <strong>Split</strong> tab first. This row is from an older saved pipeline; you can remove it after switching.
+                        </p>
+                      </div>
+                    )}
                     {inlineEditIdx === idx && inlineEditDraft ? (
                       <>
                         <StepCard
@@ -596,6 +633,12 @@ export default function Transforms({ datasetId, transformSyncKey = 0, onTransfor
               </CardContent>
             </Card>
 
+            <DeriveTemplateQueue
+              allColumns={columns}
+              disabled={inlineEditIdx !== null || transformsNeedSplitFirst}
+              onQueueSteps={(steps) => setPendingSteps((p) => [...p, ...steps])}
+            />
+
             {pendingSteps.length === 0 && (
               <div className="border-2 border-dashed border-blue-100 rounded-xl p-6 text-center">
                 <p className="text-sm text-slate-400">Choose a step type above and click Add.</p>
@@ -622,7 +665,7 @@ export default function Transforms({ datasetId, transformSyncKey = 0, onTransfor
             <CardContent className="pt-5 space-y-3">
               <Button
                 onClick={handlePreview}
-                disabled={loadingPreview}
+                disabled={loadingPreview || transformsNeedSplitFirst}
                 className="w-full"
                 variant="secondary"
               >
@@ -634,7 +677,7 @@ export default function Transforms({ datasetId, transformSyncKey = 0, onTransfor
               </Button>
               <Button
                 onClick={handleApply}
-                disabled={loadingApply || !pendingSteps.length || inlineEditIdx !== null}
+                disabled={loadingApply || !pendingSteps.length || inlineEditIdx !== null || transformsNeedSplitFirst}
                 className="w-full"
               >
                 {loadingApply ? (
@@ -884,23 +927,55 @@ export function StepCard({ step, index, allColumns, onUpdate, onRemove, hideRemo
         )}
 
         {step.type === "clip_outliers" && (
-          <div>
+          <div className="space-y-2">
             <label className="block text-xs font-medium text-slate-600 mb-1">Method</label>
-            <div className="flex gap-2">
-              {(["iqr", "zscore"] as ClipStep["method"][]).map((m) => (
+            <div className="flex flex-wrap gap-2">
+              {(["iqr", "zscore", "percentile"] as ClipStep["method"][]).map((m) => (
                 <button
                   key={m}
                   onClick={() => onUpdate({ method: m } as Partial<Step>)}
-                  className={`flex-1 py-1.5 rounded-lg text-sm border transition-colors ${
+                  className={`flex-1 min-w-[100px] py-1.5 rounded-lg text-xs border transition-colors ${
                     step.method === m
                       ? "bg-blue-600 border-blue-600 text-white"
                       : "border-slate-200 text-slate-600 hover:border-blue-400"
                   }`}
                 >
-                  {m === "iqr" ? "IQR (1.5×)" : "Z-score (±3σ)"}
+                  {m === "iqr" ? "IQR (1.5×)" : m === "zscore" ? "Z-score (±3σ)" : "Percentile"}
                 </button>
               ))}
             </div>
+            {step.method === "percentile" && (
+              <div className="flex gap-3 items-end">
+                <div className="flex-1">
+                  <label className="block text-[11px] text-slate-500 mb-0.5">Low quantile</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={0.5}
+                    step={0.005}
+                    value={step.p_low ?? 0.01}
+                    onChange={(e) =>
+                      onUpdate({ p_low: Math.min(0.49, Math.max(0, parseFloat(e.target.value) || 0)) } as Partial<Step>)
+                    }
+                    className="w-full text-sm border border-slate-200 rounded-lg px-2 py-1.5"
+                  />
+                </div>
+                <div className="flex-1">
+                  <label className="block text-[11px] text-slate-500 mb-0.5">High quantile</label>
+                  <input
+                    type="number"
+                    min={0.5}
+                    max={1}
+                    step={0.005}
+                    value={step.p_high ?? 0.99}
+                    onChange={(e) =>
+                      onUpdate({ p_high: Math.min(1, Math.max(0.51, parseFloat(e.target.value) || 1)) } as Partial<Step>)
+                    }
+                    className="w-full text-sm border border-slate-200 rounded-lg px-2 py-1.5"
+                  />
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -975,7 +1050,7 @@ export function StepCard({ step, index, allColumns, onUpdate, onRemove, hideRemo
         )}
 
         {step.type === "math_transform" && (
-          <div>
+          <div className="space-y-2">
             <label className="block text-xs font-medium text-slate-600 mb-1">Method</label>
             <div className="flex flex-wrap gap-2">
               {(["log1p", "sqrt", "square", "reciprocal", "abs"] as MathStep["method"][]).map((m) => (
@@ -992,7 +1067,28 @@ export function StepCard({ step, index, allColumns, onUpdate, onRemove, hideRemo
                 </button>
               ))}
             </div>
-            <p className="text-xs text-slate-400 mt-1.5">Applied in-place to selected numeric columns. log1p and sqrt clip negatives to 0.</p>
+            <label className="block text-xs font-medium text-slate-600 mb-1">Output</label>
+            <div className="flex gap-2">
+              {(["replace", "new_columns"] as NonNullable<MathStep["output_mode"]>[]).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => onUpdate({ output_mode: mode } as Partial<Step>)}
+                  className={`flex-1 py-1.5 rounded-lg text-xs border transition-colors ${
+                    (step.output_mode ?? "replace") === mode
+                      ? "bg-slate-800 border-slate-800 text-white"
+                      : "border-slate-200 text-slate-600 hover:border-blue-400"
+                  }`}
+                >
+                  {mode === "replace" ? "Replace column" : "New columns"}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-slate-400">
+              {(step.output_mode ?? "replace") === "new_columns"
+                ? "Adds columns such as log1p_feat, sqrt_feat (prefix depends on method)."
+                : "Overwrites selected numeric columns. log1p and sqrt clip negatives to 0."}
+            </p>
           </div>
         )}
 
@@ -1373,9 +1469,8 @@ export function StepCard({ step, index, allColumns, onUpdate, onRemove, hideRemo
                 Stratify (classification-friendly targets)
               </label>
             </div>
-            <p className="text-xs text-blue-800 bg-blue-50 border border-blue-100 rounded-lg p-2">
-              Adds <code className="text-[10px]">__ml_split__</code> (<code className="text-[10px]">train</code> /{" "}
-              <code className="text-[10px]">test</code>). Drag the applied pipeline grip to reorder like other steps. Avoid dropping <code className="text-[10px]">__ml_split__</code> in a later step if the Train tab should use these labels. Impute/scale still use full-column stats here—see <strong>Warnings &amp; reasons</strong>.
+            <p className="text-xs text-amber-900 bg-amber-50 border border-amber-100 rounded-lg p-2">
+              <strong>Legacy step</strong> — new workflows use the <strong>Split</strong> tab (before Transforms). This block remains so older saved pipelines still load. Prefer removing it after migrating.
             </p>
           </>
         )}

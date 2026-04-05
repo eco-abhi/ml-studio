@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { getExperiments, getMLflowInfo, type ExperimentRun, type MLflowInfo, type TaskType } from "../api";
+import { formatRunLabel, shortRunId } from "../lib/runLabel";
 import { LoadingState } from "../components/LoadingState";
 import { Select } from "../components/ui/select";
 import { PageShell } from "../components/PageShell";
@@ -7,25 +8,62 @@ import { Badge } from "../components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 
-type MetricKey = "rmse" | "mae" | "r2" | "cv_rmse" | "accuracy" | "f1_score" | "roc_auc";
+type MetricKey =
+  | "rmse" | "mae" | "r2" | "cv_rmse"
+  | "train_rmse" | "train_mae" | "train_r2"
+  | "accuracy" | "f1_score" | "roc_auc"
+  | "train_accuracy" | "train_f1";
 
 const META = {
   regression: {
     primary: "rmse" as MetricKey,
-    cols: ["model", "rmse", "mae", "r2", "cv_rmse"] as const,
-    lowerBetter: { rmse: true, mae: true, cv_rmse: true, r2: false } as Record<string, boolean>,
-    labels: { rmse: "RMSE", mae: "MAE", r2: "R²", cv_rmse: "CV RMSE" } as Record<string, string>,
+    cols: ["model", "train_r2", "r2", "train_rmse", "rmse", "mae", "cv_rmse"] as const,
+    lowerBetter: {
+      rmse: true,
+      mae: true,
+      cv_rmse: true,
+      train_rmse: true,
+      train_mae: true,
+      r2: false,
+      train_r2: false,
+    } as Record<string, boolean>,
+    labels: {
+      model: "Model / run",
+      rmse: "RMSE",
+      mae: "MAE",
+      r2: "R²",
+      cv_rmse: "CV RMSE",
+      train_rmse: "Train RMSE",
+      train_mae: "Train MAE",
+      train_r2: "Train R²",
+    } as Record<string, string>,
   },
   classification: {
     primary: "accuracy" as MetricKey,
-    cols: ["model", "accuracy", "f1_score", "roc_auc"] as const,
-    lowerBetter: { accuracy: false, f1_score: false, roc_auc: false } as Record<string, boolean>,
-    labels: { accuracy: "Accuracy", f1_score: "F1", roc_auc: "ROC-AUC" } as Record<string, string>,
+    cols: ["model", "train_accuracy", "accuracy", "train_f1", "f1_score", "roc_auc"] as const,
+    lowerBetter: {
+      accuracy: false,
+      f1_score: false,
+      roc_auc: false,
+      train_accuracy: false,
+      train_f1: false,
+    } as Record<string, boolean>,
+    labels: {
+      model: "Model / run",
+      accuracy: "Accuracy",
+      f1_score: "F1",
+      roc_auc: "ROC-AUC",
+      train_accuracy: "Train acc.",
+      train_f1: "Train F1",
+    } as Record<string, string>,
   },
 };
 
 const COLORS = ["#3b82f6","#10b981","#f59e0b","#ef4444","#8b5cf6","#06b6d4","#ec4899","#84cc16"];
-const ALL_METRICS: MetricKey[] = ["rmse", "mae", "r2", "cv_rmse", "accuracy", "f1_score", "roc_auc"];
+const ALL_METRICS: MetricKey[] = [
+  "rmse", "mae", "r2", "cv_rmse", "train_rmse", "train_mae", "train_r2",
+  "accuracy", "f1_score", "roc_auc", "train_accuracy", "train_f1",
+];
 
 function getBest(runs: ExperimentRun[], metric: MetricKey, lower: boolean) {
   const valid = runs.filter((r) => r[metric] !== undefined);
@@ -41,38 +79,64 @@ function fmtTs(ms: number | undefined) {
 }
 
 function MlflowLocalHint({ info }: { info: MLflowInfo | null }) {
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<"full" | "uv" | null>(null);
   if (!info || info.is_remote || !info.local_ui_command) return null;
   const cmd = info.local_ui_command;
-  const copy = () => {
-    void navigator.clipboard.writeText(cmd).then(() => {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
+  const cmdUv = info.local_ui_command_uv;
+  const copy = (which: "full" | "uv", text: string) => {
+    void navigator.clipboard.writeText(text).then(() => {
+      setCopied(which);
+      window.setTimeout(() => setCopied(null), 2000);
     });
   };
   return (
     <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-950">
       <p className="font-semibold text-amber-900">MLflow UI (local tracking)</p>
-      <p className="mt-1 text-amber-800/90 leading-relaxed">
+      {info.local_tracking_note && (
+        <p className="mt-2 text-amber-900/95 leading-relaxed border border-amber-300/60 rounded-lg bg-white/60 px-2.5 py-2">
+          {info.local_tracking_note}
+        </p>
+      )}
+      <p className="mt-2 text-amber-800/90 leading-relaxed">
         Runs are stored at{" "}
         <code className="rounded bg-white/90 px-1.5 py-0.5 text-[11px] text-amber-950 break-all">{info.tracking_uri}</code>.
-        Use the same <code className="text-[11px]">--backend-store-uri</code> when you start the UI, then open{" "}
+        Start the UI with the same store as the API, then open{" "}
         <a href={info.ui_url} className="font-medium text-blue-700 underline" target="_blank" rel="noopener noreferrer">
           {info.ui_url}
         </a>
         .
       </p>
-      <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-end">
-        <pre className="min-w-0 flex-1 overflow-x-auto rounded-lg bg-slate-900 p-2.5 font-mono text-[11px] leading-relaxed text-slate-100 whitespace-pre-wrap sm:whitespace-pre">
-          {cmd}
-        </pre>
-        <button
-          type="button"
-          onClick={copy}
-          className="shrink-0 rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium text-amber-900 transition-colors hover:bg-amber-100"
-        >
-          {copied ? "Copied" : "Copy command"}
-        </button>
+      {cmdUv && (
+        <div className="mt-3">
+          <p className="text-amber-900 font-medium mb-1">Recommended (from <code className="text-[11px]">backend/</code>)</p>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+            <pre className="min-w-0 flex-1 overflow-x-auto rounded-lg bg-slate-900 p-2.5 font-mono text-[11px] leading-relaxed text-slate-100 whitespace-pre-wrap sm:whitespace-pre">
+              {cmdUv}
+            </pre>
+            <button
+              type="button"
+              onClick={() => copy("uv", cmdUv)}
+              className="shrink-0 rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium text-amber-900 transition-colors hover:bg-amber-100"
+            >
+              {copied === "uv" ? "Copied" : "Copy"}
+            </button>
+          </div>
+        </div>
+      )}
+      <div className="mt-3">
+        <p className="text-amber-900/80 mb-1">Full command (any environment)</p>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+          <pre className="min-w-0 flex-1 overflow-x-auto rounded-lg bg-slate-900 p-2.5 font-mono text-[11px] leading-relaxed text-slate-100 whitespace-pre-wrap sm:whitespace-pre">
+            {cmd}
+          </pre>
+          <button
+            type="button"
+            onClick={() => copy("full", cmd)}
+            className="shrink-0 rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium text-amber-900 transition-colors hover:bg-amber-100"
+          >
+            {copied === "full" ? "Copied" : "Copy"}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -164,7 +228,7 @@ export default function Experiments({ datasetId, experimentsSyncKey = 0 }: Props
   });
 
   const bestRunId = getBest(runs, meta.primary, meta.lowerBetter[meta.primary]);
-  const champModel = runs.find((r) => r.run_id === bestRunId)?.model ?? null;
+  const champRun = runs.find((r) => r.run_id === bestRunId) ?? null;
   const color = (runId: string) => COLORS[runs.findIndex((r) => r.run_id === runId) % COLORS.length];
 
   const chartVals = runs.filter((r) => r[chartMetric] !== undefined)
@@ -181,7 +245,11 @@ export default function Experiments({ datasetId, experimentsSyncKey = 0 }: Props
       action={
         <div className="flex items-center gap-2">
           {mlflowLink}
-          {champModel && <Badge variant="success">★ {champModel.replace(/_/g, " ")}</Badge>}
+          {champRun && (
+            <Badge variant="success" className="max-w-[min(100vw,20rem)] truncate" title={formatRunLabel(champRun)}>
+              ★ {formatRunLabel(champRun)}
+            </Badge>
+          )}
         </div>
       }
     >
@@ -214,10 +282,22 @@ export default function Experiments({ datasetId, experimentsSyncKey = 0 }: Props
                 {[...chartVals].sort((a, b) => lb ? a.value - b.value : b.value - a.value).map(({ run_id, model, value }) => {
                   const pct = (value / maxVal) * 100;
                   const isChamp = run_id === bestRunId && chartMetric === meta.primary;
+                  const run = runs.find((r) => r.run_id === run_id);
                   return (
                     <div key={run_id} className="flex items-center gap-3">
-                      <div className={`w-44 text-sm shrink-0 truncate ${isChamp ? "font-semibold text-emerald-700" : "text-slate-600"}`}>
-                        {isChamp && <span className="mr-1">★</span>}{model.replace(/_/g, " ")}
+                      <div className={`w-52 shrink-0 min-w-0 ${isChamp ? "font-semibold text-emerald-700" : "text-slate-600"}`}>
+                        <div className="text-sm truncate">
+                          {isChamp && <span className="mr-1">★</span>}
+                          {model.replace(/_/g, " ")}
+                        </div>
+                        {run && (
+                          <div className="text-[10px] text-slate-400 font-mono truncate font-normal" title={run.run_id}>
+                            …{shortRunId(run.run_id)}
+                            {run.started_at != null
+                              ? ` · ${new Date(run.started_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`
+                              : ""}
+                          </div>
+                        )}
                       </div>
                       <div className="flex-1 h-6 bg-slate-100 rounded overflow-hidden">
                         <div
@@ -266,12 +346,20 @@ export default function Experiments({ datasetId, experimentsSyncKey = 0 }: Props
                             {cols.map((col) => (
                               <td key={col as string} className="px-4 py-3">
                                 {col === "model" ? (
-                                  <div className="flex items-center gap-2">
+                                  <div className="flex items-center gap-2 min-w-0">
                                     <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: color(run.run_id) }} />
-                                    <span className={isChamp ? "font-semibold text-slate-900" : "text-slate-700"}>
-                                      {run.model.replace(/_/g, " ")}
-                                    </span>
-                                    {isChamp && <Badge variant="success" className="text-[10px] py-0 px-1.5">best</Badge>}
+                                    <div className="min-w-0">
+                                      <div className={`truncate ${isChamp ? "font-semibold text-slate-900" : "text-slate-700"}`}>
+                                        {run.model.replace(/_/g, " ")}
+                                      </div>
+                                      <div className="text-[10px] text-slate-400 font-mono truncate" title={run.run_id}>
+                                        …{shortRunId(run.run_id)}
+                                        {run.started_at != null
+                                          ? ` · ${new Date(run.started_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`
+                                          : ""}
+                                      </div>
+                                    </div>
+                                    {isChamp && <Badge variant="success" className="text-[10px] py-0 px-1.5 shrink-0">best</Badge>}
                                   </div>
                                 ) : run[col as MetricKey] !== undefined ? (
                                   <span className={`tabular-nums ${isChamp && col === meta.primary ? "font-bold" : ""}`}>
@@ -332,11 +420,16 @@ export default function Experiments({ datasetId, experimentsSyncKey = 0 }: Props
                         : "border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50"
                     }`}
                   >
-                    <div className="flex items-center gap-2">
-                      <span className="w-2 h-2 rounded-full shrink-0" style={{ background: color(run.run_id) }} />
-                      <span className={`text-sm font-medium truncate ${isSelected ? "text-blue-800" : "text-slate-700"}`}>
-                        {run.model.replace(/_/g, " ")}
-                      </span>
+                    <div className="flex items-start gap-2">
+                      <span className="w-2 h-2 rounded-full shrink-0 mt-1.5" style={{ background: color(run.run_id) }} />
+                      <div className="min-w-0 flex-1">
+                        <div className={`text-sm font-medium leading-snug ${isSelected ? "text-blue-800" : "text-slate-700"}`}>
+                          {run.model.replace(/_/g, " ")}
+                        </div>
+                        <div className="text-[10px] text-slate-400 font-mono truncate mt-0.5" title={run.run_id}>
+                          …{shortRunId(run.run_id)}
+                        </div>
+                      </div>
                       {isChamp && <Badge variant="success" className="text-[10px] py-0 px-1.5 shrink-0">best</Badge>}
                     </div>
                     <div className="flex items-center justify-between mt-1 pl-4">
@@ -358,10 +451,10 @@ export default function Experiments({ datasetId, experimentsSyncKey = 0 }: Props
                 {/* Header */}
                 <div className="flex items-start justify-between gap-3">
                   <div>
-                    <h3 className="text-lg font-semibold text-slate-900">
-                      {selectedRun.model.replace(/_/g, " ")}
+                    <h3 className="text-lg font-semibold text-slate-900 leading-snug">
+                      {formatRunLabel(selectedRun)}
                     </h3>
-                    <p className="text-xs text-slate-400 font-mono mt-0.5">{selectedRun.run_id}</p>
+                    <p className="text-xs text-slate-400 font-mono mt-0.5 break-all">{selectedRun.run_id}</p>
                   </div>
                   <div className="flex gap-2 shrink-0">
                     <Badge variant={selectedRun.status === "FINISHED" ? "success" : "secondary"}>

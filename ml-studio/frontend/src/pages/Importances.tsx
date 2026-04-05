@@ -1,11 +1,23 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { getExperiments, getImportances, type ExperimentRun, type ImportanceItem } from "../api";
+import { compactRunLabel, formatRunLabel, shortRunId } from "../lib/runLabel";
 import { LoadingState } from "../components/LoadingState";
-import { Select } from "../components/ui/select";
 import { PageShell } from "../components/PageShell";
-import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
+import { Button } from "../components/ui/button";
+import { Card, CardContent } from "../components/ui/card";
 
-const COLORS = ["#3b82f6", "#f59e0b"];
+const PALETTE = [
+  "#3b82f6",
+  "#f59e0b",
+  "#10b981",
+  "#ef4444",
+  "#8b5cf6",
+  "#06b6d4",
+  "#ec4899",
+  "#84cc16",
+  "#64748b",
+  "#d946ef",
+];
 
 interface Props {
   datasetId: string | null;
@@ -14,12 +26,10 @@ interface Props {
 
 export default function Importances({ datasetId, experimentsSyncKey = 0 }: Props) {
   const [runs, setRuns] = useState<ExperimentRun[]>([]);
-  const [modelA, setModelA] = useState<string | null>(null);
-  const [modelB, setModelB] = useState<string | null>(null);
-  const [impsA, setImpsA] = useState<ImportanceItem[] | null>(null);
-  const [impsB, setImpsB] = useState<ImportanceItem[] | null>(null);
-  const [loadingA, setLoadingA] = useState(false);
-  const [loadingB, setLoadingB] = useState(false);
+  /** MLflow run ids to compare (each training run is distinct, even for the same model name). */
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [byRunId, setByRunId] = useState<Record<string, ImportanceItem[] | null>>({});
+  const [loading, setLoading] = useState(false);
   const [runsLoading, setRunsLoading] = useState(false);
 
   useEffect(() => {
@@ -28,27 +38,67 @@ export default function Importances({ datasetId, experimentsSyncKey = 0 }: Props
     getExperiments(datasetId)
       .then((d) => {
         setRuns(d.runs);
-        if (d.runs[0]) setModelA(d.runs[0].model);
-        if (d.runs[1]) setModelB(d.runs[1].model);
+        setSelected((prev) => {
+          if (prev.size && d.runs.some((r) => prev.has(r.run_id))) {
+            const next = new Set([...prev].filter((id) => d.runs.some((r) => r.run_id === id)));
+            return next.size ? next : new Set(d.runs.map((r) => r.run_id));
+          }
+          return new Set(d.runs.map((r) => r.run_id));
+        });
       })
       .finally(() => setRunsLoading(false));
   }, [datasetId, experimentsSyncKey]);
 
-  useEffect(() => {
-    if (!modelA || !datasetId) return;
-    setLoadingA(true);
-    getImportances(datasetId, modelA)
-      .then((res) => setImpsA(Array.isArray(res) ? res : null))
-      .finally(() => setLoadingA(false));
-  }, [modelA, datasetId]);
+  const selectedRuns = useMemo(
+    () => runs.filter((r) => selected.has(r.run_id)),
+    [runs, selected],
+  );
+
+  const loadImportances = useCallback(async () => {
+    if (!datasetId || selectedRuns.length === 0) {
+      setByRunId({});
+      return;
+    }
+    setLoading(true);
+    try {
+      const entries = await Promise.all(
+        selectedRuns.map(async (run) => {
+          try {
+            const res = await getImportances(datasetId, run.model, run.run_id);
+            return [run.run_id, res] as const;
+          } catch {
+            return [run.run_id, null] as const;
+          }
+        }),
+      );
+      setByRunId(Object.fromEntries(entries));
+    } finally {
+      setLoading(false);
+    }
+  }, [datasetId, selectedRuns]);
 
   useEffect(() => {
-    if (!modelB || !datasetId) return;
-    setLoadingB(true);
-    getImportances(datasetId, modelB)
-      .then((res) => setImpsB(Array.isArray(res) ? res : null))
-      .finally(() => setLoadingB(false));
-  }, [modelB, datasetId]);
+    void loadImportances();
+  }, [loadImportances]);
+
+  const toggleRun = (runId: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(runId)) {
+        if (next.size <= 1) return prev;
+        next.delete(runId);
+      } else {
+        next.add(runId);
+      }
+      return next;
+    });
+  };
+
+  const selectAll = () => setSelected(new Set(runs.map((r) => r.run_id)));
+  const selectNone = () => {
+    const first = runs[0]?.run_id;
+    if (first) setSelected(new Set([first]));
+  };
 
   if (!datasetId) return <Empty />;
   if (runsLoading) {
@@ -60,104 +110,174 @@ export default function Importances({ datasetId, experimentsSyncKey = 0 }: Props
   }
   if (!runs.length) return <Empty msg="No trained models found." />;
 
-  // Deduplicate by model name so selectors never have duplicate keys/options
-  const uniqueRuns = runs.filter((r, i, arr) => arr.findIndex((x) => x.model === r.model) === i);
+  const maps: Record<string, Record<string, number>> = {};
+  for (const run of selectedRuns) {
+    const list = byRunId[run.run_id];
+    maps[run.run_id] = list ? Object.fromEntries(list.map((f) => [f.feature, f.importance])) : {};
+  }
 
-  const mapA = impsA ? Object.fromEntries(impsA.map((f) => [f.feature, f.importance])) : {};
-  const mapB = impsB ? Object.fromEntries(impsB.map((f) => [f.feature, f.importance])) : {};
-  const features = impsA ? [...impsA].sort((a, b) => b.importance - a.importance).map((f) => f.feature) : [];
-  const maxVal = Math.max(...Object.values(mapA), ...Object.values(mapB), 0.0001);
-  const comparing = !!(modelB && modelB !== modelA && impsB);
+  const allFeatures = new Set<string>();
+  for (const run of selectedRuns) {
+    const list = byRunId[run.run_id];
+    if (list) list.forEach((f) => allFeatures.add(f.feature));
+  }
 
-  const rankB = impsB ? [...impsB].sort((a, b) => b.importance - a.importance).map((f) => f.feature) : [];
-  const sharedTop3 = impsA ? impsA.slice(0, 3).map((f) => f.feature).filter((f) => rankB.slice(0, 3).includes(f)) : [];
+  const featureRankScore = (f: string) =>
+    Math.max(0, ...selectedRuns.map((run) => maps[run.run_id]?.[f] ?? 0));
+
+  const features = [...allFeatures].sort((a, b) => featureRankScore(b) - featureRankScore(a));
+
+  const maxVal = Math.max(
+    0.0001,
+    ...selectedRuns.flatMap((run) => Object.values(maps[run.run_id] ?? {})),
+  );
+
+  const multiCompare = selectedRuns.length > 1;
+  const colorFor = (i: number) => PALETTE[i % PALETTE.length];
+
+  const top3Sets = selectedRuns.map((run) => {
+    const list = byRunId[run.run_id];
+    if (!list) return new Set<string>();
+    return new Set([...list].sort((a, b) => b.importance - a.importance).slice(0, 3).map((f) => f.feature));
+  });
+  const inEveryTop3 =
+    top3Sets.length > 0
+      ? [...top3Sets[0]].filter((f) => top3Sets.every((s) => s.has(f)))
+      : [];
+
+  const top1ByRun = selectedRuns.map((run) => {
+    const list = byRunId[run.run_id];
+    if (!list?.length) return null;
+    return [...list].sort((a, b) => b.importance - a.importance)[0]?.feature ?? null;
+  });
 
   return (
     <PageShell title="Feature Importances" description="Compare which features each model relies on.">
       <div className="space-y-5">
-        {/* ── Model Selectors ── */}
-        <div className="grid grid-cols-2 gap-4">
-          {([
-            { label: "Model A", color: COLORS[0], value: modelA, set: setModelA },
-            { label: "Model B", color: COLORS[1], value: modelB, set: setModelB },
-          ] as const).map(({ label, color, value, set }) => (
-            <div key={label}>
-              <label className="flex items-center gap-2 text-sm font-medium text-slate-700 mb-1.5">
-                <span className="w-3 h-3 rounded" style={{ background: color }} />
-                {label}
-              </label>
-              <Select
-                value={value ?? ""}
-                onChange={set}
-                options={uniqueRuns.map((r) => ({ value: r.model, label: r.model.replace(/_/g, " ") }))}
-              />
+        <div className="rounded-xl border border-slate-200 bg-slate-50/80 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+            <p className="text-sm font-medium text-slate-700">Runs to compare</p>
+            <div className="flex gap-2">
+              <Button type="button" variant="outline" size="sm" onClick={selectAll}>
+                Select all
+              </Button>
+              <Button type="button" variant="outline" size="sm" onClick={selectNone}>
+                Single only
+              </Button>
             </div>
-          ))}
+          </div>
+          <div className="flex flex-wrap gap-x-4 gap-y-2">
+            {runs.map((r) => (
+              <label
+                key={r.run_id}
+                className="flex cursor-pointer items-center gap-2 text-sm text-slate-700 select-none max-w-[280px]"
+              >
+                <input
+                  type="checkbox"
+                  className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 shrink-0"
+                  checked={selected.has(r.run_id)}
+                  onChange={() => toggleRun(r.run_id)}
+                />
+                <span className="leading-tight">
+                  <span className="block font-medium">{r.model.replace(/_/g, " ")}</span>
+                  <span className="block text-[10px] text-slate-400 font-mono">
+                    …{shortRunId(r.run_id)}
+                    {r.started_at != null
+                      ? ` · ${new Date(r.started_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`
+                      : ""}
+                  </span>
+                </span>
+              </label>
+            ))}
+          </div>
+          {selectedRuns.length > 8 && (
+            <p className="mt-2 text-[11px] text-amber-800/90">
+              Many models selected — the chart uses one bar per model per feature; scroll or narrow the selection if it feels crowded.
+            </p>
+          )}
         </div>
 
-        {(loadingA || loadingB) && (
+        {loading && (
           <LoadingState message="Computing feature importances…" className="min-h-[200px]" />
         )}
 
-        {/* ── Legend ── */}
-        {comparing && (
-          <div className="flex gap-4">
-            {[modelA, modelB].map((m, i) => (
-              <div key={m} className="flex items-center gap-2 text-xs text-slate-600">
-                <span className="w-3 h-3 rounded" style={{ background: COLORS[i] }} />
-                {m?.replace(/_/g, " ")}
+        {multiCompare && selectedRuns.length > 0 && !loading && (
+          <div className="flex flex-wrap gap-x-4 gap-y-2">
+            {selectedRuns.map((run, i) => (
+              <div key={run.run_id} className="flex items-center gap-2 text-xs text-slate-600 max-w-[220px]">
+                <span className="h-3 w-3 shrink-0 rounded" style={{ background: colorFor(i) }} />
+                <span className="truncate" title={formatRunLabel(run)}>
+                  {compactRunLabel(run)}
+                </span>
               </div>
             ))}
           </div>
         )}
 
-        {/* ── Bars ── */}
-        {features.length > 0 && !loadingA && (
+        {features.length > 0 && !loading && (
           <Card>
-            <CardContent className="pt-6 space-y-3">
-              {features.map((feature) => {
-                const vA = mapA[feature] ?? 0;
-                const vB = mapB[feature] ?? 0;
-                return (
-                  <div key={feature}>
-                    <div className="flex justify-between items-baseline mb-1">
-                      <span className="text-sm font-medium text-slate-700">{feature}</span>
-                      {comparing ? (
-                        <span className="text-xs text-slate-500 tabular-nums">
-                          <span style={{ color: COLORS[0] }} className="font-semibold">{vA.toFixed(4)}</span>
-                          <span className="mx-1 text-slate-300">vs</span>
-                          <span style={{ color: COLORS[1] }} className="font-semibold">{vB.toFixed(4)}</span>
-                        </span>
-                      ) : (
-                        <span className="text-xs text-slate-500 tabular-nums font-semibold">{vA.toFixed(4)}</span>
-                      )}
-                    </div>
-                    <div className="h-4 bg-slate-100 rounded overflow-hidden mb-0.5">
-                      <div className="h-full rounded transition-all duration-300" style={{ width: `${(vA / maxVal) * 100}%`, background: COLORS[0] }} />
-                    </div>
-                    {comparing && (
-                      <div className="h-4 bg-slate-100 rounded overflow-hidden">
-                        <div className="h-full rounded transition-all duration-300" style={{ width: `${(vB / maxVal) * 100}%`, background: COLORS[1], opacity: 0.85 }} />
-                      </div>
-                    )}
+            <CardContent className="space-y-3 pt-6">
+              {features.map((feature) => (
+                <div key={feature}>
+                  <div className="mb-1 flex items-baseline justify-between gap-2">
+                    <span className="text-sm font-medium text-slate-700">{feature}</span>
+                    <span className="text-right text-[11px] tabular-nums text-slate-500">
+                      {selectedRuns.map((run, i) => {
+                        const v = maps[run.run_id]?.[feature] ?? 0;
+                        return (
+                          <span key={run.run_id}>
+                            {i > 0 && <span className="text-slate-300"> · </span>}
+                            <span style={{ color: colorFor(i) }} className="font-semibold">
+                              {v.toFixed(4)}
+                            </span>
+                          </span>
+                        );
+                      })}
+                    </span>
                   </div>
-                );
-              })}
+                  {selectedRuns.map((run, i) => {
+                    const v = maps[run.run_id]?.[feature] ?? 0;
+                    return (
+                      <div key={run.run_id} className="mb-0.5 h-3.5 overflow-hidden rounded bg-slate-100 last:mb-0">
+                        <div
+                          className="h-full rounded transition-all duration-300"
+                          style={{
+                            width: `${(v / maxVal) * 100}%`,
+                            background: colorFor(i),
+                            opacity: selectedRuns.length > 1 ? 0.88 : 1,
+                          }}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              ))}
 
-              {/* Agreement summary */}
-              {comparing && impsA && impsB && (
-                <div className="mt-4 p-3 bg-slate-50 rounded-lg text-xs text-slate-600 border border-slate-200">
+              {multiCompare && selectedRuns.length >= 2 && (
+                <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
                   <strong>Top-3 agreement:</strong>{" "}
-                  {sharedTop3.length === 0
-                    ? "No overlap — models rely on very different features."
-                    : `${sharedTop3.length}/3 shared (${sharedTop3.join(", ")}).`
-                  }
-                  {" "}Top for <span style={{ color: COLORS[0] }} className="font-semibold">{modelA?.replace(/_/g, " ")}</span>: <strong>{features[0]}</strong>.{" "}
-                  Top for <span style={{ color: COLORS[1] }} className="font-semibold">{modelB?.replace(/_/g, " ")}</span>: <strong>{rankB[0]}</strong>.
+                  {inEveryTop3.length === 0 ? (
+                    <>No single feature appears in the top 3 for every selected model.</>
+                  ) : (
+                    <>
+                      In all models’ top 3: <strong>{inEveryTop3.join(", ")}</strong>.
+                    </>
+                  )}
+                  <div className="mt-2 space-y-0.5 border-t border-slate-200 pt-2">
+                    {selectedRuns.map((run, i) => (
+                      <div key={run.run_id}>
+                        Top for{" "}
+                        <span style={{ color: colorFor(i) }} className="font-semibold">
+                          {compactRunLabel(run)}
+                        </span>
+                        : <strong>{top1ByRun[i] ?? "—"}</strong>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
 
-              <p className="text-xs text-slate-400 pt-2 border-t border-slate-100">
+              <p className="border-t border-slate-100 pt-2 text-xs text-slate-400">
                 Tree models: built-in split importances. Linear models: |coef| × feature std.
               </p>
             </CardContent>
@@ -169,5 +289,9 @@ export default function Importances({ datasetId, experimentsSyncKey = 0 }: Props
 }
 
 function Empty({ msg = "Upload and train a dataset first." }: { msg?: string }) {
-  return <PageShell title="Feature Importances"><p className="text-sm text-slate-500">{msg}</p></PageShell>;
+  return (
+    <PageShell title="Feature Importances">
+      <p className="text-sm text-slate-500">{msg}</p>
+    </PageShell>
+  );
 }
